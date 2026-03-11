@@ -60,18 +60,25 @@ setup_tls() {
     fi
 
     # Request cert if none exist, or wait for another instance to provide them
+    local attempts=0
+    local max_attempts=60  # 60 * 5s = 5 min max wait
     while [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; do
         if acquire_lock; then
             # We got the lock — check S3 again (another instance may have pushed while we waited)
             pull_certs || true
             if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; then
                 log_info "No certs found, requesting new certificate..."
-                renew_or_request || { log_error "Certificate request failed"; exit 1; }
+                renew_or_request || { log_error "Certificate request failed"; release_lock || true; exit 1; }
                 push_certs || log_error "Failed to push certs to S3"
             fi
             release_lock || log_warn "Failed to release lock"
         else
-            log_info "Lock held by another instance, waiting for certs to appear in S3..."
+            attempts=$((attempts + 1))
+            if [[ "$attempts" -ge "$max_attempts" ]]; then
+                log_error "Timed out waiting for certs after ${max_attempts} attempts"
+                exit 1
+            fi
+            log_info "Lock held by another instance, waiting for certs (attempt $attempts/$max_attempts)..."
             sleep 5
             pull_certs || true
         fi
