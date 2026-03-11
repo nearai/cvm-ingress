@@ -31,6 +31,18 @@ derive_encryption_key() {
     log_info "Encryption key derived successfully"
 }
 
+ensure_s3_bucket() {
+    if ! aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+        log_info "Bucket $S3_BUCKET does not exist, creating..."
+        if ! aws s3api create-bucket --bucket "$S3_BUCKET" --region "${AWS_DEFAULT_REGION:-us-east-1}" \
+            --create-bucket-configuration LocationConstraint="${AWS_DEFAULT_REGION:-us-east-1}" 2>/dev/null; then
+            log_error "Failed to create S3 bucket $S3_BUCKET"
+            exit 1
+        fi
+        log_info "Bucket $S3_BUCKET created"
+    fi
+}
+
 generate_nginx_config() {
     log_info "Generating nginx config for $DOMAIN → $BACKEND_HOST:$BACKEND_PORT"
     export DOLLAR='$'
@@ -62,15 +74,18 @@ main() {
     # Step 2: Derive encryption key from dstack
     derive_encryption_key
 
-    # Step 3: Setup Cloudflare credentials
+    # Step 3: Ensure S3 bucket exists
+    ensure_s3_bucket
+
+    # Step 4: Setup Cloudflare credentials
     setup_cloudflare_credentials
 
-    # Step 4: Pull certs from S3 (if they exist)
+    # Step 5: Pull certs from S3 (if they exist)
     if ! pull_certs; then
         log_warn "Failed to pull certs from S3, will attempt fresh request"
     fi
 
-    # Step 5: Request cert if none exist
+    # Step 6: Request cert if none exist
     if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; then
         log_info "No certs found, requesting new certificate..."
         if acquire_lock; then
@@ -83,19 +98,19 @@ main() {
         fi
     fi
 
-    # Step 6: Verify certs exist before starting nginx
+    # Step 7: Verify certs exist before starting nginx
     if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]] || [[ ! -f "/certs/$DOMAIN/privkey.pem" ]]; then
         log_error "Certificate files not found after setup, cannot start nginx"
         exit 1
     fi
 
-    # Step 7: Generate nginx config
+    # Step 8: Generate nginx config
     generate_nginx_config
 
-    # Step 8: Start renewal daemon in background
+    # Step 9: Start renewal daemon in background
     renewal_daemon &
 
-    # Step 9: Start nginx in foreground
+    # Step 10: Start nginx in foreground
     log_info "Starting nginx"
     exec nginx -g "daemon off;"
 }
