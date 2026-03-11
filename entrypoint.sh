@@ -59,18 +59,23 @@ setup_tls() {
         log_warn "Failed to pull certs from S3, will attempt fresh request"
     fi
 
-    # Request cert if none exist
-    if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; then
-        log_info "No certs found, requesting new certificate..."
+    # Request cert if none exist, or wait for another instance to provide them
+    while [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; do
         if acquire_lock; then
-            renew_or_request || { log_error "Certificate request failed"; exit 1; }
-            push_certs || log_error "Failed to push certs to S3"
+            # We got the lock — check S3 again (another instance may have pushed while we waited)
+            pull_certs || true
+            if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]]; then
+                log_info "No certs found, requesting new certificate..."
+                renew_or_request || { log_error "Certificate request failed"; exit 1; }
+                push_certs || log_error "Failed to push certs to S3"
+            fi
             release_lock || log_warn "Failed to release lock"
         else
-            log_error "Could not acquire lock for initial cert request"
-            exit 1
+            log_info "Lock held by another instance, waiting for certs to appear in S3..."
+            sleep 5
+            pull_certs || true
         fi
-    fi
+    done
 
     # Verify certs exist
     if [[ ! -f "/certs/$DOMAIN/fullchain.pem" ]] || [[ ! -f "/certs/$DOMAIN/privkey.pem" ]]; then
