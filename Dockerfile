@@ -26,6 +26,6 @@ COPY nginx/ /app/nginx/
 
 RUN chmod +x /app/entrypoint.sh /app/lib/*.sh
 
-EXPOSE 443
+EXPOSE 8443
 
 ENTRYPOINT ["/app/entrypoint.sh"]

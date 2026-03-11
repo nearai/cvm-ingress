@@ -16,4 +16,4 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     ports:
-      - "443:443"
+      - "8443:8443"
