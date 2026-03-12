@@ -2,15 +2,15 @@ services:
   ingress:
     build: .
     environment:
-      DOMAIN: "cloud-api.near.ai"
-      CERTBOT_EMAIL: "robert.yan@near.ai"
+      DOMAIN: "api.example.com"
+      CERTBOT_EMAIL: "you@example.com"
       CLOUDFLARE_API_TOKEN: "${CLOUDFLARE_API_TOKEN}"
-      S3_BUCKET: "nearai-cvm-ingress-certs"
-      S3_PREFIX: "cloud-api-test"
+      S3_BUCKET: "your-certs-bucket"
+      S3_PREFIX: "your-prefix"
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
       AWS_DEFAULT_REGION: "us-west-2"
-      BACKEND_HOST: "cloud-api"
+      BACKEND_HOST: "your-backend"
       BACKEND_PORT: "3000"
       STAGING: "true"
     volumes:
