@@ -31,31 +31,41 @@ require_command() {
 	fi
 }
 
-for required in docker skopeo jq git; do
+for required in docker; do
 	require_command "$required"
 done
+
+if [ "$PUSH" = true ]; then
+	require_command skopeo
+fi
 
 # Check if buildkit_20 already exists before creating it
 if ! docker buildx inspect buildkit_20 &>/dev/null; then
 	docker buildx create --use --driver-opt image=moby/buildkit:v0.20.2 --name buildkit_20
 fi
 
-git rev-parse HEAD >.GIT_REV
-TEMP_TAG="cvm-ingress:$(date +%s)"
-docker buildx build --builder buildkit_20 --no-cache --build-arg SOURCE_DATE_EPOCH="0" \
+touch pinned-packages.txt
+TEMP_TAG="cvm-ingress-temp:$(date +%s)"
+docker buildx build --builder buildkit_20 --platform linux/amd64 --no-cache --build-arg SOURCE_DATE_EPOCH="0" \
 	--output type=oci,dest=./oci.tar,rewrite-timestamp=true \
 	--output type=docker,name="$TEMP_TAG",rewrite-timestamp=true .
 
 if [ "$?" -ne 0 ]; then
 	echo "Build failed"
-	rm .GIT_REV
 	exit 1
 fi
 
-echo "Build completed, manifest digest:"
+echo "Build completed, OCI archive sha256:"
 echo ""
-skopeo inspect oci-archive:./oci.tar | jq .Digest
+sha256sum oci.tar | awk '{print $1}'
 echo ""
+
+if command -v skopeo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+	echo "Manifest digest:"
+	echo ""
+	skopeo inspect oci-archive:./oci.tar | jq .Digest
+	echo ""
+fi
 
 if [ "$PUSH" = true ]; then
 	echo "Pushing image to $REPO..."
@@ -73,7 +83,10 @@ else
 fi
 echo ""
 
+# Extract package information from the built image
+echo "Extracting package information from built image: $TEMP_TAG"
+docker run --rm --entrypoint bash "$TEMP_TAG" -lc "dpkg -l | grep '^ii' | awk '{print \$2\"=\"\$3}' | sort" > pinned-packages.txt
+echo "Package information extracted to pinned-packages.txt ($(wc -l < pinned-packages.txt) packages)"
+
 # Clean up the temporary image from Docker daemon
 docker rmi "$TEMP_TAG" 2>/dev/null || true
-
-rm .GIT_REV
