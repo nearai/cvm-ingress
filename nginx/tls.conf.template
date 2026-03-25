@@ -19,6 +19,19 @@ server {
     resolver 127.0.0.11 valid=5s;
     set ${DOLLAR}backend "http://${BACKEND_HOST}:${BACKEND_PORT}";
 
+    # When nginx itself cannot reach the backend (connection refused, timeout),
+    # close the TCP connection instead of returning an HTTP error. This makes
+    # the failure visible as a TCP RST to upstream L4 proxies, allowing them
+    # to mark this backend as unavailable and route to healthy instances.
+    # Note: proxy_intercept_errors is intentionally OFF (default) so that
+    # HTTP errors returned BY the backend (e.g. cloud-api returning 502
+    # because an inference provider failed) pass through to the client normally.
+    error_page 502 503 504 = @backend_down;
+
+    location @backend_down {
+        return 444;
+    }
+
     location / {
         proxy_pass ${DOLLAR}backend;
         proxy_set_header Host ${DOLLAR}host;
