@@ -40,12 +40,15 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
 RUN mkdir -p /certs /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /var/log/nginx /run/nginx && \
     chown -R www-data:www-data /certs /run/nginx
 
-# Remove default nginx site.
-RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf
+# Remove default nginx site and install custom nginx.conf with stdout/stderr logging.
+RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf && \
+    ln -sf /dev/stdout /var/log/nginx/access.log && \
+    ln -sf /dev/stderr /var/log/nginx/error.log
 
 COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 COPY --chmod=755 lib/ /app/lib/
 COPY --chmod=644 nginx/ /app/nginx/
+COPY --chmod=644 nginx/nginx.conf /etc/nginx/nginx.conf
 
 RUN rm -rf \
     /var/log/dpkg.log \
