@@ -16,4 +16,8 @@ services:
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     ports:
-      - "8443:8443"
+      # TCP for HTTP/1.1 and HTTP/2 over TLS.
+      - "8443:8443/tcp"
+      # UDP for HTTP/3 (QUIC). The container advertises h3=":8443" via Alt-Svc;
+      # clients only upgrade when the UDP path reaches the listener.
+      - "8443:8443/udp"
