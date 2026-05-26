@@ -7,14 +7,10 @@ ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     DEBIAN_FRONTEND=noninteractive
 
-# Bootstrap certificates so apt can reach the Debian snapshot over HTTPS.
-# (ca-certificates is already present in the upstream nginx image, but we
-# re-run to keep the bootstrap step idempotent and explicit.)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
-
-# Install the remaining userland tooling from the pinned Debian snapshot.
+# Install userland tooling from the pinned Debian snapshot.
+# (ca-certificates is already present in the upstream nginx image at the
+# version pinned below, so we do NOT run a bootstrap apt-get against live
+# repos — that would drift whenever upstream republishes the package.)
 # nginx itself is provided by the upstream image (from nginx.org's repo) and
 # is intentionally NOT listed here — pinning it via Debian's archive would
 # downgrade it to 1.22.x which lacks --with-http_v3_module.
