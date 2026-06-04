@@ -34,7 +34,10 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == 'tag' ]]; then
             TAG=${GITHUB_REF_NAME#v}
           else
-            TAG='latest'
+            # main → :staging (continuously-integrated channel the
+            # cloud-api-staging ingress tracks). :latest is the promoted prod
+            # channel, moved only by promote.yml — never by a main push.
+            TAG='staging'
           fi
           echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
 
@@ -51,7 +54,7 @@ jobs:
             SOURCE_DATE_EPOCH=0
 
       - name: Generate artifact attestation (GitHub)
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}
           subject-digest: ${{ steps.docker_build.outputs.digest }}
