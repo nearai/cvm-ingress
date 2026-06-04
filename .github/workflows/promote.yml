@@ -60,11 +60,15 @@ jobs:
         run: |
           set -euo pipefail
           STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
-          DIGEST=$(skopeo inspect "docker://${STAGING_REF}" | jq -r '.Digest')
-          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
-            echo "::error::Could not resolve :staging digest — has build-push.yml run on main yet?"
+          # build-push.yml (docker/build-push-action) publishes an OCI image
+          # INDEX (the image + a provenance attestation manifest). For an index,
+          # `skopeo inspect`'s cooked .Digest is unreliable (no platform match),
+          # so derive the true top-level digest by hashing the raw manifest.
+          if ! skopeo inspect --raw "docker://${STAGING_REF}" >/dev/null 2>&1; then
+            echo "::error::Could not fetch :staging — has build-push.yml run on main yet?"
             exit 1
           fi
+          DIGEST="sha256:$(skopeo inspect --raw "docker://${STAGING_REF}" | sha256sum | cut -d' ' -f1)"
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           echo "Promoting digest: ${DIGEST}"
 
@@ -88,17 +92,24 @@ jobs:
       - name: Promote :staging → :latest
         run: |
           set -euo pipefail
+          # --all --preserve-digests: copy the FULL image index (image +
+          # attestation manifest) and keep byte-for-byte digests. Without --all,
+          # skopeo would flatten the index to the single amd64 manifest and move
+          # :latest to a different digest than the one we verified/signed.
           # Copy from the verified digest (not the :staging tag) so the bytes
-          # pushed to :latest are provably identical to the digest we verified,
-          # regardless of any concurrent main push racing the :staging tag.
-          skopeo copy --insecure-policy \
+          # pushed to :latest are provably the verified ones, regardless of any
+          # concurrent main push racing the :staging tag.
+          skopeo copy --all --preserve-digests --insecure-policy \
             "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}" \
             "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest"
 
       - name: Confirm :latest resolves to the promoted digest
         run: |
           set -euo pipefail
-          LATEST_DIGEST=$(skopeo inspect "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest" | jq -r '.Digest')
+          # Index-safe: hash the raw top-level manifest (cooked .Digest is empty
+          # for an index). With --preserve-digests above this must match, but we
+          # verify explicitly before signing rather than trust the copy.
+          LATEST_DIGEST="sha256:$(skopeo inspect --raw "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest" | sha256sum | cut -d' ' -f1)"
           if [ "${LATEST_DIGEST}" != "${IMAGE_DIGEST}" ]; then
             echo "::error:::latest resolved to ${LATEST_DIGEST}, expected ${IMAGE_DIGEST}"
             exit 1
