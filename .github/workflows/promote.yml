@@ -1,0 +1,120 @@
+name: Promote to Production
+
+# Promotes the continuously-integrated :staging image to the :prod channel
+# (published as :latest) and re-signs it with keyless cosign.
+#
+# Channel model (mirrors nearai/dstack-vpc, nearai/cloud-api):
+#   main push      -> :staging   (build-push.yml; cloud-api-staging ingress tracks this)
+#   promote (here) -> :latest     (cloud-api-prod ingress tracks this)
+#
+# :latest only ever moves through this manual, confirmation-gated workflow, so
+# a merge to main can never silently change what production resolves.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "promote" to confirm promoting :staging to :latest'
+        required: true
+
+env:
+  REGISTRY: docker.io
+  IMAGE_REPOSITORY: nearaidev/cvm-ingress
+
+# Serialize :latest mutations so two promotions can't split-brain the prod tag.
+concurrency:
+  group: prod-image-mutation
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote staging → latest
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "promote" ]; then
+            echo "Confirmation input must be exactly 'promote'" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: nearaidev
+          password: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+
+      - name: Install skopeo and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Resolve :staging digest
+        run: |
+          set -euo pipefail
+          STAGING_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging"
+          DIGEST=$(skopeo inspect "docker://${STAGING_REF}" | jq -r '.Digest')
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "null" ]; then
+            echo "::error::Could not resolve :staging digest — has build-push.yml run on main yet?"
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+          echo "Promoting digest: ${DIGEST}"
+
+      # Gate: only promote a digest that build-push.yml built and signed FROM main.
+      # The :staging tag is mutable — a manual registry push or a compromised
+      # registry credential could land an arbitrary image there. Verify the
+      # keyless cosign signature, anchored to this repo's build-push.yml workflow
+      # on refs/heads/main (build-push.yml is workflow_dispatch-able, so an
+      # attacker-modified branch run could publish :staging and match a looser
+      # path-only identity), so we never bless untrusted bytes as :prod.
+      - name: Verify :staging was built and signed by build-push.yml on main
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/nearai/cvm-ingress/\.github/workflows/build-push\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --certificate-github-workflow-repository 'nearai/cvm-ingress' \
+            --certificate-github-workflow-ref 'refs/heads/main' \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}"
+
+      - name: Promote :staging → :latest
+        run: |
+          set -euo pipefail
+          # Copy from the verified digest (not the :staging tag) so the bytes
+          # pushed to :latest are provably identical to the digest we verified,
+          # regardless of any concurrent main push racing the :staging tag.
+          skopeo copy --insecure-policy \
+            "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}" \
+            "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest"
+
+      - name: Confirm :latest resolves to the promoted digest
+        run: |
+          set -euo pipefail
+          LATEST_DIGEST=$(skopeo inspect "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest" | jq -r '.Digest')
+          if [ "${LATEST_DIGEST}" != "${IMAGE_DIGEST}" ]; then
+            echo "::error:::latest resolved to ${LATEST_DIGEST}, expected ${IMAGE_DIGEST}"
+            exit 1
+          fi
+          echo ":latest confirmed at ${LATEST_DIGEST}"
+
+      - name: Sign promoted :latest with cosign (keyless)
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}"
+
+      - name: Generate promotion summary
+        run: |
+          {
+            echo "## ${{ env.IMAGE_REPOSITORY }} promoted to production"
+            echo ""
+            echo "- promoted: \`:staging\` → \`:latest\`"
+            echo "- digest: \`${IMAGE_DIGEST}\`"
+            echo "- sigstore: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
