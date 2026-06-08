@@ -1,36 +1,42 @@
 name: Promote to Production
 
-# Promotes the continuously-integrated :staging image to the :prod channel
-# (published as :latest) and re-signs it with keyless cosign.
+# Promotes the continuously-integrated :staging image to the :prod channel,
+# writes an immutable prod-YYYYMMDD-<shortsha> rollback tag, and keeps :latest
+# as a compatibility alias for deploy code that still resolves that channel.
 #
 # Channel model (mirrors nearai/dstack-vpc, nearai/cloud-api):
 #   main push      -> :staging   (build-push.yml; cloud-api-staging ingress tracks this)
-#   promote (here) -> :latest     (cloud-api-prod ingress tracks this)
+#   promote (here) -> :prod      (primary prod channel)
+#   promote (here) -> :latest    (temporary prod compatibility alias)
 #
-# :latest only ever moves through this manual, confirmation-gated workflow, so
+# :prod only ever moves through this manual, confirmation-gated workflow, so
 # a merge to main can never silently change what production resolves.
+
+permissions:
+  contents: write
 
 on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "promote" to confirm promoting :staging to :latest'
+        description: 'Type "promote" to confirm promoting :staging to :prod'
         required: true
 
 env:
   REGISTRY: docker.io
   IMAGE_REPOSITORY: nearaidev/cvm-ingress
 
-# Serialize :latest mutations so two promotions can't split-brain the prod tag.
+# Serialize production mutations so two promotions can't split-brain the prod
+# channel, compatibility alias, or immutable rollback tags.
 concurrency:
   group: prod-image-mutation
   cancel-in-progress: false
 
 jobs:
   promote:
-    name: Promote staging → latest
+    name: Promote staging → prod
     permissions:
-      contents: read
+      contents: write
       id-token: write
     runs-on: ubuntu-latest
     steps:
@@ -71,6 +77,30 @@ jobs:
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           echo "Promoting digest: ${DIGEST}"
 
+          SHORT_SHA="unknown"
+          PAGE_URL="https://hub.docker.com/v2/namespaces/nearaidev/repositories/cvm-ingress/tags?page_size=100"
+          MAX_PAGES=50
+          PAGE_COUNT=0
+          while [ -n "$PAGE_URL" ] && [ "$PAGE_URL" != "null" ] && [ "$PAGE_COUNT" -lt "$MAX_PAGES" ]; do
+            RESP=$(curl -fsS --max-time 30 --retry 2 --retry-delay 2 "$PAGE_URL")
+            MATCH=$(echo "$RESP" | jq -r --arg d "$DIGEST" '.results[] | select(.digest==$d) | select(.name | test("^staging-[0-9]{8}-[0-9a-f]{7}$")) | .name' | head -n1)
+            if [ -n "$MATCH" ]; then
+              SHORT_SHA=$(echo "$MATCH" | sed -E 's/^staging-[0-9]{8}-//')
+              break
+            fi
+            PAGE_URL=$(echo "$RESP" | jq -r '.next')
+            PAGE_COUNT=$((PAGE_COUNT + 1))
+          done
+          if [ "$PAGE_COUNT" -ge "$MAX_PAGES" ]; then
+            echo "::warning::Reached MAX_PAGES=${MAX_PAGES} during staging-* tag search; using digest-derived suffix."
+          fi
+          if [ "$SHORT_SHA" = "unknown" ]; then
+            SHORT_SHA=$(echo "${DIGEST}" | sed 's/^sha256://' | cut -c1-7)
+            echo "No matching staging-* tag found; using digest-derived suffix: ${SHORT_SHA}"
+          fi
+          echo "SOURCE_SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "Resolved source short-sha: ${SHORT_SHA}"
+
       # Gate: only promote a digest that build-push.yml built and signed FROM main.
       # The :staging tag is mutable — a manual registry push or a compromised
       # registry credential could land an arbitrary image there. Verify the
@@ -88,39 +118,85 @@ jobs:
             --certificate-github-workflow-ref 'refs/heads/main' \
             "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}"
 
-      - name: Promote :staging → :latest
+      - name: Promote :staging → :prod
         run: |
           set -euo pipefail
           # Copy from the verified digest (not the :staging tag) so the bytes
-          # pushed to :latest are provably identical to the digest we verified,
-          # regardless of any concurrent main push racing the :staging tag.
+          # pushed to :prod, the stamped tag, and :latest are provably
+          # identical to the digest we verified, regardless of any concurrent
+          # main push racing the :staging tag.
+          STAMP=$(date -u +%Y%m%d)
+          PROD_STAMPED_TAG="prod-${STAMP}-${SOURCE_SHORT_SHA}"
+          PROD_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:prod"
+          PROD_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${PROD_STAMPED_TAG}"
+          LATEST_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest"
           skopeo copy --insecure-policy \
             "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}" \
-            "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest"
+            "docker://${PROD_REF}"
+          skopeo copy --insecure-policy \
+            "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}" \
+            "docker://${PROD_STAMPED_REF}"
+          skopeo copy --insecure-policy \
+            "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}" \
+            "docker://${LATEST_REF}"
+          echo "PROD_REF=${PROD_REF}" >> "$GITHUB_ENV"
+          echo "PROD_STAMPED_TAG=${PROD_STAMPED_TAG}" >> "$GITHUB_ENV"
+          echo "PROD_STAMPED_REF=${PROD_STAMPED_REF}" >> "$GITHUB_ENV"
+          echo "LATEST_REF=${LATEST_REF}" >> "$GITHUB_ENV"
 
-      # Defend against a registry replica serving a stale/forked :latest: confirm
-      # the tag we just wrote resolves to exactly the digest we verified before
-      # we sign it. Fail loudly rather than sign an unexpected digest.
-      - name: Confirm :latest resolves to the promoted digest
+      # Defend against a registry replica serving a stale/forked tag: confirm
+      # every tag we just wrote resolves to exactly the digest we verified
+      # before we sign it. Fail loudly rather than sign an unexpected digest.
+      - name: Confirm prod tags resolve to the promoted digest
         run: |
           set -euo pipefail
-          LATEST_DIGEST=$(skopeo inspect "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:latest" | jq -r '.Digest')
-          if [ "${LATEST_DIGEST}" != "${IMAGE_DIGEST}" ]; then
-            echo "::error:::latest resolved to ${LATEST_DIGEST}, expected ${IMAGE_DIGEST}"
-            exit 1
-          fi
-          echo ":latest confirmed at ${LATEST_DIGEST}"
+          for tag in prod "${PROD_STAMPED_TAG}" latest; do
+            RESOLVED_DIGEST=$(skopeo inspect "docker://${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${tag}" | jq -r '.Digest')
+            if [ "${RESOLVED_DIGEST}" != "${IMAGE_DIGEST}" ]; then
+              echo "::error::${tag} resolved to ${RESOLVED_DIGEST}, expected ${IMAGE_DIGEST}"
+              exit 1
+            fi
+            echo ":${tag} confirmed at ${RESOLVED_DIGEST}"
+          done
 
-      - name: Sign promoted :latest with cosign (keyless)
+      - name: Sign promoted digest with cosign (keyless)
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${IMAGE_DIGEST}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${PROD_STAMPED_TAG}"
+          NOTES=$(cat <<EOF
+          ## Production Promotion
+
+          - **Image**: \`${PROD_REF}\`
+          - **Stamped image**: \`${PROD_STAMPED_REF}\`
+          - **Compatibility alias**: \`${LATEST_REF}\`
+          - **Digest**: \`${IMAGE_DIGEST}\`
+          - **Source short-sha**: \`${SOURCE_SHORT_SHA}\`
+          - **Sigstore**: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Production Release ${TAG}" --notes "$NOTES"
+          else
+            gh release create "$TAG" --title "Production Release ${TAG}" --notes "$NOTES" --latest
+          fi
+          echo "RELEASE_TAG=${TAG}" >> "$GITHUB_ENV"
 
       - name: Generate promotion summary
         run: |
           {
             echo "## ${{ env.IMAGE_REPOSITORY }} promoted to production"
             echo ""
-            echo "- promoted: \`:staging\` → \`:latest\`"
+            echo "- promoted: \`:staging\` → \`:prod\`"
+            echo "- stamped tag: \`${PROD_STAMPED_REF}\`"
+            echo "- compatibility alias: \`${LATEST_REF}\`"
             echo "- digest: \`${IMAGE_DIGEST}\`"
+            echo "- release: \`${RELEASE_TAG}\`"
             echo "- sigstore: https://search.sigstore.dev/?hash=${IMAGE_DIGEST}"
           } >> "$GITHUB_STEP_SUMMARY"

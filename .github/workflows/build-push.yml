@@ -55,11 +55,16 @@ jobs:
             TAG=${GITHUB_REF_NAME#v}
           else
             # main → :staging (continuously-integrated channel the
-            # cloud-api-staging ingress tracks). :latest is the promoted prod
-            # channel, moved only by promote.yml — never by a main push.
+            # cloud-api-staging ingress tracks). :prod is the promoted
+            # production channel, moved only by promote.yml — never by a main
+            # push. promote.yml also updates :latest as a compatibility alias
+            # for deploy code that has not yet switched to :prod.
             TAG='staging'
           fi
           echo "IMAGE_REFERENCE=${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:${TAG}" >> "$GITHUB_ENV"
+          if [[ "${GITHUB_REF_TYPE}" == 'branch' && "${GITHUB_REF_NAME}" == 'main' ]]; then
+            echo "ALSO_TAG_STAGING_STAMP=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Install build dependencies
         run: |
@@ -93,6 +98,16 @@ jobs:
         run: |
           cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ env.IMAGE_DIGEST }}"
 
+      - name: Push immutable staging tag
+        if: env.ALSO_TAG_STAGING_STAMP == 'true'
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          STAMP=$(date -u +%Y%m%d)
+          STAGING_STAMPED_REF="${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}:staging-${STAMP}-${SHORT_SHA}"
+          skopeo copy --insecure-policy oci-archive:./oci.tar "docker://${STAGING_STAMPED_REF}"
+          echo "STAGING_STAMPED_REFERENCE=${STAGING_STAMPED_REF}" >> "$GITHUB_ENV"
+
       - name: Generate build summary
         run: |
           {
@@ -103,4 +118,7 @@ jobs:
             echo "- commit: \`${{ github.sha }}\`"
             echo "- reproduce: \`./build-image.sh\` then \`skopeo inspect oci-archive:./oci.tar | jq -r .Digest\` on a native-amd64 host"
             echo "- sigstore: https://search.sigstore.dev/?hash=${{ env.IMAGE_DIGEST }}"
+            if [[ "${{ env.ALSO_TAG_STAGING_STAMP }}" == "true" ]]; then
+              echo "- staging stamped: \`${{ env.STAGING_STAMPED_REFERENCE }}\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
