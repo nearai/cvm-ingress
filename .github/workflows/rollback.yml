@@ -57,6 +57,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y skopeo jq
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Resolve target tag and digest
         id: resolve
         env:
@@ -119,6 +122,16 @@ jobs:
           echo "target_digest=${TARGET_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "previous_digest=${CURRENT_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "audit_tag=${AUDIT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify rollback target was built and signed by build-push.yml on main
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/nearai/cvm-ingress/\.github/workflows/build-push\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            --certificate-github-workflow-repository 'nearai/cvm-ingress' \
+            --certificate-github-workflow-ref 'refs/heads/main' \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_REPOSITORY }}@${{ steps.resolve.outputs.target_digest }}"
 
       - name: Re-tag production aliases
         run: |
