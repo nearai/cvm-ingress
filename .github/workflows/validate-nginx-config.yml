@@ -1,0 +1,29 @@
+name: Validate nginx config
+
+# Builds the image from this repo's Dockerfile, renders both nginx templates
+# the way entrypoint.sh does, and runs `nginx -t` inside that image — so the
+# check exercises the exact nginx binary and tooling that ship, catching
+# config syntax errors before an image is published or promoted.
+#
+# Then runs the containers and exercises the error-response contract end to
+# end (tests/test-error-responses.sh): nginx-generated 400/413/414/497 must
+# return the generic JSON envelope, backend-produced envelopes must pass
+# through untouched, and backend-down must keep closing the connection (444).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  nginx-config-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render templates and run nginx -t
+        run: ./validate-nginx-config.sh
+
+      - name: Runtime error-response tests
+        run: VALIDATE_IMAGE=cvm-ingress-validate:local ./tests/test-error-responses.sh
