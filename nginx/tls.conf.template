@@ -27,6 +27,22 @@ server {
     # ma=86400 = cache the advertisement for 24h once verified.
     add_header Alt-Svc 'h3=":8443"; ma=86400' always;
 
+    # Security headers (nearai/infra#196). `always` attaches them to every
+    # response status, including proxied 4xx/5xx and locally generated errors.
+    #
+    # add_header inheritance trap: server-level add_header directives reach a
+    # location only if that location declares NO add_header of its own. Keep
+    # location blocks in this file free of add_header (or re-declare the full
+    # set there) — tests/test-headers.sh enforces this invariant.
+    add_header Strict-Transport-Security 'max-age=31536000; includeSubDomains' always;
+    add_header X-Content-Type-Options 'nosniff' always;
+
+    # The backend does not set these headers itself (audited 2026-07-22), but
+    # hide any upstream copy so the add_header values above stay the single
+    # source of truth if a backend ever starts emitting them.
+    proxy_hide_header Strict-Transport-Security;
+    proxy_hide_header X-Content-Type-Options;
+
     proxy_buffering off;
     proxy_read_timeout 600s;
     proxy_send_timeout 600s;
