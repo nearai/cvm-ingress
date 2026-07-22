@@ -87,10 +87,15 @@ check_config plain default.conf
 check_config tls tls.conf
 
 # --- Runtime assertion: Server header has no version ------------------------
+# Extra arguments after the URL are passed to curl. The TLS caller needs
+# --connect-to so the probe presents the configured DOMAIN as SNI + Host:
+# the TLS server rejects unknown SNI/Host (nearai/infra#195), so a bare
+# https://127.0.0.1 probe would fail at the handshake.
 assert_banner() {
     local name=$1 url=$2 headers
+    shift 2
     for _ in $(seq 1 20); do
-        headers=$(curl -skI --max-time 2 "$url" 2>/dev/null) && break
+        headers=$(curl -skI --max-time 2 "$@" "$url" 2>/dev/null) && break
         sleep 0.5
     done
     [[ -n "${headers:-}" ]] || fail "$name: no response from $url"
@@ -116,6 +121,7 @@ docker run -d --name cvm-ingress-test-tls --tmpfs /run/nginx \
     -p "127.0.0.1:$TLS_PORT:8443" \
     "$BASE_IMAGE" nginx -g 'daemon off;' >/dev/null
 CONTAINERS+=(cvm-ingress-test-tls)
-assert_banner tls "https://127.0.0.1:$TLS_PORT/nginx-health"
+assert_banner tls "https://$DOMAIN:$TLS_PORT/nginx-health" \
+    --connect-to "$DOMAIN:$TLS_PORT:127.0.0.1:$TLS_PORT"
 
 echo "All nginx config checks passed."
