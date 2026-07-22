@@ -1,0 +1,22 @@
+name: Config Tests
+
+# Renders the nginx templates the same way entrypoint.sh does, lints them with
+# `nginx -t` inside the pinned base image, and runs a container-level check
+# that every response class (2xx/3xx/4xx/5xx, health endpoint, streaming)
+# carries exactly one copy of the security headers. See tests/test-headers.sh.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  header-tests:
+    name: nginx config + response headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run config/header tests
+        run: ./tests/test-headers.sh
