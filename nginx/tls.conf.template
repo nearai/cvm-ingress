@@ -1,9 +1,38 @@
+# Deny-by-default catch-all (nearai/infra#195).
+#
+# TLS layer: any client whose SNI is not exactly ${DOMAIN} lands on this
+# default_server and the handshake itself is rejected (unrecognized_name
+# alert) — this covers arbitrary SNI, empty SNI, and IP-literal connections.
+#
+# HTTP layer: a request that completed the handshake with the correct SNI but
+# carries a Host / :authority header that does not match ${DOMAIN} (arbitrary
+# domains, localhost, IP literals, SNI/Host mismatches) is routed here by
+# nginx's virtual-server selection and the connection is closed (444) before
+# any proxying. Malformed Host values are rejected by nginx itself with a
+# generic 400 before server selection.
+#
+# Loopback/deploy health checks must therefore send the real domain as both
+# SNI and Host, e.g.:
+#   curl -sk --connect-to ${DOMAIN}:443:127.0.0.1:<port> https://${DOMAIN}/nginx-health
+server {
+    listen 8443 ssl default_server;
+    listen [::]:8443 ssl default_server;
+    listen 8443 quic default_server;
+    listen [::]:8443 quic default_server;
+
+    server_name _;
+    ssl_reject_handshake on;
+
+    return 444;
+}
+
 server {
     # HTTP/1.1 + HTTP/2 over TCP.
     listen 8443 ssl;
     listen [::]:8443 ssl;
     # HTTP/3 over QUIC (UDP). `reuseport` enables per-worker socket sharding;
-    # safe here because cvm-ingress renders exactly one server block.
+    # it is a socket-level option and may only appear on one listen directive
+    # per address:port, so the catch-all above does not repeat it.
     listen 8443 quic reuseport;
     listen [::]:8443 quic reuseport;
 
@@ -51,7 +80,12 @@ server {
 
     location / {
         proxy_pass ${DOLLAR}backend;
-        proxy_set_header Host ${DOLLAR}host;
+        # Pin the upstream Host header to the configured domain instead of
+        # forwarding the client-supplied value, so the backend can never see
+        # (or act on) an attacker-controlled Host (nearai/infra#195). Requests
+        # only reach this server when the Host already matches ${DOMAIN}; the
+        # pin makes the value deterministic (no port suffix, no case variants).
+        proxy_set_header Host ${DOMAIN};
         proxy_set_header X-Real-IP ${DOLLAR}remote_addr;
         proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto ${DOLLAR}scheme;

@@ -1,3 +1,24 @@
+# Deny-by-default catch-all (nearai/infra#195): any request whose Host header
+# does not match ${DOMAIN} (arbitrary domains, localhost, IP literals) is
+# routed here by nginx's virtual-server selection and the connection is closed
+# (444) before any proxying. Malformed Host values are rejected by nginx
+# itself with a generic 400 before server selection.
+#
+# /nginx-health stays reachable on this catch-all so loopback/in-container
+# probes that address the listener by IP keep working in non-TLS mode.
+server {
+    listen 8443 default_server;
+    server_name _;
+
+    location = /nginx-health {
+        return 200 "ok";
+    }
+
+    location / {
+        return 444;
+    }
+}
+
 server {
     listen 8443;
     server_name ${DOMAIN};
@@ -26,7 +47,9 @@ server {
 
     location / {
         proxy_pass ${DOLLAR}backend;
-        proxy_set_header Host ${DOLLAR}host;
+        # Pin the upstream Host header to the configured domain instead of
+        # forwarding the client-supplied value (nearai/infra#195).
+        proxy_set_header Host ${DOMAIN};
         proxy_set_header X-Real-IP ${DOLLAR}remote_addr;
         proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto ${DOLLAR}scheme;
