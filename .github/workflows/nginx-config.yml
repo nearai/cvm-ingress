@@ -1,0 +1,24 @@
+name: Nginx Config Check
+
+# Renders both server templates the way entrypoint.sh does, runs
+# `nginx -t` / `nginx -T` inside the pinned base image, and asserts the
+# effective config (and the live Server response header) never discloses
+# the nginx version (nearai/infra#194).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate nginx configuration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate nginx configuration
+        run: ./test-nginx-config.sh
