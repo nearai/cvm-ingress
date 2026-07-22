@@ -32,7 +32,7 @@ BACKEND_PORT="3000"
 
 # Use the exact base image the production image is built FROM (pinned digest),
 # so nginx -t and the runtime test exercise the same nginx binary.
-IMAGE="$(sed -n 's/^FROM[[:space:]]\+\(nginx[^[:space:]]*\).*/\1/p' "$REPO_ROOT/Dockerfile" | head -n1)"
+IMAGE="$(awk '/^FROM[[:space:]]+nginx/ { print $2; exit }' "$REPO_ROOT/Dockerfile")"
 if [[ -z "$IMAGE" ]]; then
     echo "FAIL: could not parse pinned nginx image from Dockerfile" >&2
     exit 1
@@ -188,7 +188,7 @@ docker run -d --name "$INGRESS_CTR" --network "$NET" \
 
 BASE="https://127.0.0.1:$HOST_PORT"
 for i in $(seq 1 30); do
-    if curl -ks --max-time 2 "$BASE/nginx-health" | grep -q ok; then
+    if [[ "$(curl -ks --max-time 2 "$BASE/nginx-health" || true)" == *ok* ]]; then
         break
     fi
     [[ "$i" == "30" ]] && { docker logs "$INGRESS_CTR" >&2 || true; fail "ingress did not become ready"; }
@@ -200,8 +200,10 @@ echo "Ingress up on $BASE (backend: stub on :$BACKEND_PORT)"
 check_headers() {
     local path="$1" want_status="$2" want_body="${3:-}"
     local raw status hsts_n xcto_n hsts_line xcto_line body
-    raw="$(curl -ksi --max-time 15 "$BASE$path")"
-    status="$(printf '%s' "$raw" | head -n1 | awk '{print $2}')"
+    # Strip CRs up front; tr consumes the whole stream, so no early-exit
+    # consumer (head/-q grep) can SIGPIPE the producer under pipefail.
+    raw="$(curl -ksi --max-time 15 "$BASE$path" | tr -d '\r')"
+    read -r _ status _ <<<"$raw"
     [[ "$status" == "$want_status" ]] || fail "$path: expected status $want_status, got $status"
 
     hsts_n="$(printf '%s' "$raw" | grep -ci '^strict-transport-security:' || true)"
@@ -209,8 +211,8 @@ check_headers() {
     [[ "$hsts_n" == "1" ]] || fail "$path: expected exactly 1 Strict-Transport-Security header, got $hsts_n"
     [[ "$xcto_n" == "1" ]] || fail "$path: expected exactly 1 X-Content-Type-Options header, got $xcto_n"
 
-    hsts_line="$(printf '%s' "$raw" | grep -i '^strict-transport-security:' | tr -d '\r')"
-    xcto_line="$(printf '%s' "$raw" | grep -i '^x-content-type-options:' | tr -d '\r')"
+    hsts_line="$(printf '%s' "$raw" | grep -i '^strict-transport-security:')"
+    xcto_line="$(printf '%s' "$raw" | grep -i '^x-content-type-options:')"
     [[ "$hsts_line" == *"$HSTS_VALUE"* ]] || fail "$path: HSTS value mismatch: '$hsts_line'"
     [[ "$xcto_line" == *"$XCTO_VALUE"* ]] || fail "$path: X-Content-Type-Options value mismatch: '$xcto_line'"
 
