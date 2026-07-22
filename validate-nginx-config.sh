@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 # Renders nginx/default.conf.template and nginx/tls.conf.template the same way
 # entrypoint.sh does (envsubst with DOLLAR='$') and validates each result with
-# `nginx -t` inside the exact base image pinned in the Dockerfile, so the
-# check runs against the nginx binary the deployed image ships.
+# `nginx -t` inside the image built from this repository's Dockerfile, so the
+# check runs against the exact nginx binary and userland tooling (gettext-base,
+# openssl) that the deployed image ships — not whatever the base image happens
+# to bundle.
 #
 # Usage: ./validate-nginx-config.sh
+#   VALIDATE_IMAGE=<ref>  validate inside <ref> instead of building the
+#                         Dockerfile first (local iteration shortcut; CI
+#                         always builds).
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-IMAGE="$(sed -n 's/^FROM[[:space:]]\+\([^ ]\+\).*/\1/p' Dockerfile | head -1)"
+IMAGE="${VALIDATE_IMAGE:-}"
 if [[ -z "$IMAGE" ]]; then
-    echo "Could not determine base image from Dockerfile" >&2
-    exit 1
+    IMAGE="cvm-ingress-validate:local"
+    echo "Building $IMAGE from ./Dockerfile"
+    docker build -t "$IMAGE" .
 fi
-echo "Validating nginx templates against $IMAGE"
+echo "Validating nginx templates inside $IMAGE"
 
-docker run --rm -i -v "$PWD/nginx:/templates:ro" "$IMAGE" bash -s <<'SCRIPT'
+docker run --rm -i --entrypoint bash -v "$PWD/nginx:/templates:ro" "$IMAGE" -s <<'SCRIPT'
 set -euo pipefail
+
+for tool in envsubst openssl nginx; do
+    if ! command -v "$tool" >/dev/null; then
+        echo "missing required tool in validation image: $tool" >&2
+        exit 1
+    fi
+done
+
 export DOMAIN=example.test BACKEND_HOST=backend BACKEND_PORT=8080 DOLLAR='$'
 
 mkdir -p /run/nginx "/certs/$DOMAIN"

@@ -1,8 +1,9 @@
 name: Validate nginx config
 
-# Renders both nginx templates the way entrypoint.sh does and runs `nginx -t`
-# inside the pinned base image, catching config syntax errors before an image
-# is built or promoted.
+# Builds the image from this repo's Dockerfile, renders both nginx templates
+# the way entrypoint.sh does, and runs `nginx -t` inside that image — so the
+# check exercises the exact nginx binary and tooling that ship, catching
+# config syntax errors before an image is published or promoted.
 
 on:
   pull_request:
