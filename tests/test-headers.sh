@@ -186,9 +186,13 @@ docker run -d --name "$INGRESS_CTR" --network "$NET" \
     -v "$WORK_DIR/certs:/certs:ro" \
     --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && exec nginx -g "daemon off;"' >/dev/null
 
-BASE="https://127.0.0.1:$HOST_PORT"
+# The TLS server rejects unknown SNI/Host (nearai/infra#195), so every probe
+# must present the configured DOMAIN as SNI + Host: connect to the published
+# loopback port via --connect-to while keeping the domain in the URL.
+BASE="https://$DOMAIN:$HOST_PORT"
+CURL_CONNECT=(--connect-to "$DOMAIN:$HOST_PORT:127.0.0.1:$HOST_PORT")
 for i in $(seq 1 30); do
-    if [[ "$(curl -ks --max-time 2 "$BASE/nginx-health" || true)" == *ok* ]]; then
+    if [[ "$(curl -ks --max-time 2 "${CURL_CONNECT[@]}" "$BASE/nginx-health" || true)" == *ok* ]]; then
         break
     fi
     [[ "$i" == "30" ]] && { docker logs "$INGRESS_CTR" >&2 || true; fail "ingress did not become ready"; }
@@ -202,7 +206,7 @@ check_headers() {
     local raw status hsts_n xcto_n hsts_line xcto_line body
     # Strip CRs up front; tr consumes the whole stream, so no early-exit
     # consumer (head/-q grep) can SIGPIPE the producer under pipefail.
-    raw="$(curl -ksi --max-time 15 "$BASE$path" | tr -d '\r')"
+    raw="$(curl -ksi --max-time 15 "${CURL_CONNECT[@]}" "$BASE$path" | tr -d '\r')"
     read -r _ status _ <<<"$raw"
     [[ "$status" == "$want_status" ]] || fail "$path: expected status $want_status, got $status"
 
@@ -234,7 +238,7 @@ check_headers /dup          200 dup      # backend sets its own copies -> hidden
 # delivered well before the (rate-limited) body completes = streamed, not
 # buffered end-to-end.
 sse_out="$WORK_DIR/sse.out"
-read -r sse_status sse_ct sse_ttfb sse_total < <(curl -ksN --max-time 60 -o "$sse_out" \
+read -r sse_status sse_ct sse_ttfb sse_total < <(curl -ksN --max-time 60 "${CURL_CONNECT[@]}" -o "$sse_out" \
     -w '%{http_code} %{content_type} %{time_starttransfer} %{time_total}\n' "$BASE/sse")
 [[ "$sse_status" == "200" ]] || fail "/sse: expected 200, got $sse_status"
 [[ "$sse_ct" == *"text/event-stream"* ]] || fail "/sse: expected text/event-stream, got $sse_ct"

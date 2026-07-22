@@ -1,0 +1,26 @@
+name: SNI/Host Tests
+
+# Builds the image from this repository's Dockerfile (the exact artifact that
+# ships) and asserts the SNI/Host security boundary on the running container
+# (nearai/infra#195): valid SNI + matching Host proxied with the upstream Host
+# pinned; unknown/empty SNI rejected at the TLS handshake; foreign, localhost,
+# and IP-literal Hosts rejected for both HTTP/1.1 and HTTP/2; and the
+# equivalent non-TLS paths. See tests/test-sni-host.sh.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sni-host-tests:
+    name: exact-image SNI/Host enforcement
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run SNI/Host enforcement tests
+        run: ./tests/test-sni-host.sh
