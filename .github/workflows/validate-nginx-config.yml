@@ -1,0 +1,20 @@
+name: Validate nginx config
+
+# Renders both nginx templates the way entrypoint.sh does and runs `nginx -t`
+# inside the pinned base image, catching config syntax errors before an image
+# is built or promoted.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  nginx-config-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render templates and run nginx -t
+        run: ./validate-nginx-config.sh
