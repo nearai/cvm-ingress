@@ -1,0 +1,25 @@
+name: Admin Audit Log Tests
+
+# Builds the image from this repository's Dockerfile (the exact artifact that
+# ships) and asserts the access log records the backend's
+# X-Admin-Audit-Request-Id response header as admin_audit_request_id: never a
+# client-supplied header, with unambiguous "-" (absent) and "" (empty) values,
+# and every pre-existing log field unchanged. See tests/test-admin-audit-log.sh.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  admin-audit-log-tests:
+    name: exact-image admin audit log correlation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run admin audit log tests
+        run: ./tests/test-admin-audit-log.sh
