@@ -17,7 +17,16 @@
 #      each header — including when the backend emits its own conflicting
 #      copies (proxy_hide_header must win).
 #
-# Requirements: docker, openssl, curl, awk. Run from anywhere:
+#   4. PROXY protocol mode (PROXY_PROTOCOL=true, nearai/cvm-ingress client
+#      address handling): rendered config has proxy_protocol on every TCP
+#      listener, no QUIC listener / http3 / Alt-Svc, and the same security
+#      headers; at runtime the PROXY-header address (v1 IPv4/IPv6, v2) from a
+#      trusted source replaces X-Forwarded-For and X-Real-IP (caller-supplied
+#      values discarded), an untrusted source's PROXY header is not honoured,
+#      and a connection without a PROXY header is refused. Default mode keeps
+#      the legacy X-Forwarded-For append and the Alt-Svc advertisement.
+#
+# Requirements: docker, openssl, curl, awk, python3. Run from anywhere:
 #   ./tests/test-headers.sh
 set -euo pipefail
 
@@ -43,10 +52,12 @@ WORK_DIR="$(mktemp -d)"
 NET="sechdr-net-$$"
 BACKEND_CTR="sechdr-backend-$$"
 INGRESS_CTR="sechdr-ingress-$$"
+PP_CTR="sechdr-pp-$$"
+PPU_CTR="sechdr-ppu-$$"
 HOST_PORT="$((20000 + RANDOM % 20000))"
 
 cleanup() {
-    docker rm -f "$BACKEND_CTR" "$INGRESS_CTR" >/dev/null 2>&1 || true
+    docker rm -f "$BACKEND_CTR" "$INGRESS_CTR" "$PP_CTR" "$PPU_CTR" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
     rm -rf "$WORK_DIR"
 }
@@ -71,9 +82,40 @@ render() {
     fi
 }
 
+# PROXY protocol mode render: derive the INGRESS_* template variables with the
+# same code the entrypoint uses (lib/validate.sh), then render as above.
+render_pp() {
+    local template="$1" out="$2" real_ip_from="$3"
+    (
+        # shellcheck source=/dev/null
+        source "$REPO_ROOT/lib/log.sh"
+        # shellcheck source=/dev/null
+        source "$REPO_ROOT/lib/validate.sh"
+        export DOMAIN BACKEND_HOST BACKEND_PORT
+        PROXY_PROTOCOL=true REAL_IP_FROM="$real_ip_from" validate_env >/dev/null 2>&1 \
+            || { echo "validate_env rejected REAL_IP_FROM=$real_ip_from" >&2; exit 1; }
+        if command -v envsubst >/dev/null 2>&1; then
+            DOLLAR='$' envsubst <"$template" >"$out"
+        else
+            docker run --rm -i -e DOLLAR='$' -e DOMAIN -e BACKEND_HOST -e BACKEND_PORT \
+                -e INGRESS_PP_LISTEN -e INGRESS_QUIC_OFF -e INGRESS_XFF_LEGACY_OFF \
+                -e INGRESS_REAL_IP_CONF -e INGRESS_XFF_CONF \
+                --entrypoint envsubst "$IMAGE" <"$template" >"$out"
+        fi
+    )
+}
+
 render "$REPO_ROOT/nginx/tls.conf.template" "$WORK_DIR/tls.conf"
 render "$REPO_ROOT/nginx/default.conf.template" "$WORK_DIR/default.conf"
-echo "Rendered both templates"
+# Trusted source for the runtime PROXY tests: the private ranges Docker hands
+# out for bridge networks / the host gateway. The untrusted variant names an
+# address (TEST-NET-3) that no test traffic can originate from.
+TRUSTED_FROM="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+UNTRUSTED_FROM="203.0.113.1"
+render_pp "$REPO_ROOT/nginx/tls.conf.template" "$WORK_DIR/tls-pp.conf" "$TRUSTED_FROM"
+render_pp "$REPO_ROOT/nginx/default.conf.template" "$WORK_DIR/default-pp.conf" "$TRUSTED_FROM"
+render_pp "$REPO_ROOT/nginx/tls.conf.template" "$WORK_DIR/tls-pp-untrusted.conf" "$UNTRUSTED_FROM"
+echo "Rendered default and PROXY-protocol templates"
 
 # --- 1. Static checks on the rendered TLS config ------------------------------
 
@@ -114,6 +156,50 @@ awk '
 
 echo "PASS: static config checks"
 
+# --- 1b. Static checks: default vs PROXY protocol mode ------------------------
+
+for f in tls default; do
+    ! grep -Eq 'proxy_protocol|set_real_ip_from|real_ip_header' "$WORK_DIR/$f.conf" \
+        || fail "default $f render must not contain any PROXY protocol / realip directive"
+    grep -Eq '^[[:space:]]*proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;' "$WORK_DIR/$f.conf" \
+        || fail "default $f render lost the legacy X-Forwarded-For line"
+done
+n="$(grep -Ec '^[[:space:]]*listen .*quic' "$WORK_DIR/tls.conf" || true)"
+[[ "$n" == "4" ]] || fail "default tls render: expected 4 active QUIC listeners, found $n"
+grep -Eq "^[[:space:]]*add_header Alt-Svc 'h3=\":8443\"; ma=86400' always;" "$WORK_DIR/tls.conf" \
+    || fail "default tls render lost the Alt-Svc advertisement"
+grep -Eq '^[[:space:]]*http3 on;' "$WORK_DIR/tls.conf" || fail "default tls render lost http3 on"
+
+for f in tls-pp default-pp; do
+    # Every active TCP listen carries proxy_protocol; none may be without it.
+    listens="$(grep -E '^[[:space:]]*listen ' "$WORK_DIR/$f.conf")"
+    [[ -n "$listens" ]] || fail "$f: no active listen directives"
+    bare="$(printf '%s\n' "$listens" | grep -vc 'proxy_protocol' || true)"
+    [[ "$bare" == "0" ]] || fail "$f: $bare active listen directive(s) without proxy_protocol"
+    # No active QUIC/HTTP3/Alt-Svc (commented-out template lines are fine).
+    ! grep -Eq '^[[:space:]]*(listen .*quic|http3 |add_header Alt-Svc)' "$WORK_DIR/$f.conf" \
+        || fail "$f: QUIC/HTTP3/Alt-Svc still active in PROXY protocol mode"
+    # Each server block recovers the address from the PROXY header, only from
+    # the configured source, and overwrites the forwarding headers.
+    n="$(grep -Ec '^[[:space:]]*real_ip_header proxy_protocol;' "$WORK_DIR/$f.conf" || true)"
+    [[ "$n" == "2" ]] || fail "$f: expected real_ip_header proxy_protocol in both server blocks, found $n"
+    n="$(grep -Ec '^[[:space:]]*set_real_ip_from ' "$WORK_DIR/$f.conf" || true)"
+    [[ "$n" == "6" ]] || fail "$f: expected 3 trusted sources x 2 server blocks, found $n"
+    ! grep -Eq 'set_real_ip_from (0\.0\.0\.0|::|[^;]*/0;)' "$WORK_DIR/$f.conf" || fail "$f: trusts a wildcard source"
+    ! grep -Eq '^[[:space:]]*proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;' "$WORK_DIR/$f.conf" \
+        || fail "$f: caller-appending X-Forwarded-For still active"
+    grep -Eq '^[[:space:]]*proxy_set_header X-Forwarded-For \$remote_addr;' "$WORK_DIR/$f.conf" \
+        || fail "$f: X-Forwarded-For is not overwritten with the client address"
+    grep -Eq '^[[:space:]]*proxy_set_header X-Real-IP \$remote_addr;' "$WORK_DIR/$f.conf" \
+        || fail "$f: X-Real-IP is not set from the client address"
+done
+# Security headers survive PROXY mode and the inheritance guard still holds.
+grep -Fq "add_header Strict-Transport-Security '$HSTS_VALUE' always;" "$WORK_DIR/tls-pp.conf" \
+    || fail "tls-pp: HSTS header missing"
+grep -Fq "add_header X-Content-Type-Options '$XCTO_VALUE' always;" "$WORK_DIR/tls-pp.conf" \
+    || fail "tls-pp: X-Content-Type-Options header missing"
+echo "PASS: static checks (default vs PROXY protocol render)"
+
 # --- 2. nginx -t on both rendered configs -------------------------------------
 
 mkdir -p "$WORK_DIR/certs/$DOMAIN"
@@ -135,7 +221,21 @@ docker run --rm \
     --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && nginx -t' \
     || fail "nginx -t rejected the rendered plain config"
 
-echo "PASS: nginx -t on both rendered configs"
+for f in tls-pp tls-pp-untrusted; do
+    docker run --rm \
+        -v "$REPO_ROOT/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        -v "$WORK_DIR/$f.conf:/etc/nginx/conf.d/default.conf:ro" \
+        -v "$WORK_DIR/certs:/certs:ro" \
+        --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && nginx -t' \
+        || fail "nginx -t rejected the rendered $f config"
+done
+docker run --rm \
+    -v "$REPO_ROOT/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+    -v "$WORK_DIR/default-pp.conf:/etc/nginx/conf.d/default.conf:ro" \
+    --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && nginx -t' \
+    || fail "nginx -t rejected the rendered plain PROXY protocol config"
+
+echo "PASS: nginx -t on all rendered configs (default, PROXY protocol trusted/untrusted)"
 
 # --- 3. Runtime header behavior ------------------------------------------------
 
@@ -151,6 +251,10 @@ server {
     location = /missing  { return 404 "missing\n"; }
     location = /boom     { return 500 "boom\n"; }
     location = /redirect { return 301 /ok; }
+    # Echo what the ingress forwards: used by the PROXY protocol tests.
+    location = /echo {
+        return 200 "xff=[$http_x_forwarded_for] rip=[$http_x_real_ip] peer=[$remote_addr]\n";
+    }
     location = /dup {
         add_header Strict-Transport-Security "max-age=1" always;
         add_header X-Content-Type-Options "nosniff" always;
@@ -248,6 +352,121 @@ awk -v ttfb="$sse_ttfb" -v total="$sse_total" 'BEGIN { exit !(total - ttfb >= 1.
     || fail "/sse: response was not streamed (TTFB $sse_ttfb vs total $sse_total)"
 check_headers /sse 200
 echo "PASS: /sse streamed (TTFB ${sse_ttfb}s, total ${sse_total}s, $sse_got bytes intact)"
+
+# --- 4. Client address handling ------------------------------------------------
+
+# Default mode (unchanged behaviour): the ingress appends its TCP peer to a
+# caller-supplied X-Forwarded-For, and still advertises HTTP/3.
+echo_out="$(curl -ks --max-time 15 "${CURL_CONNECT[@]}" -H 'X-Forwarded-For: 1.2.3.4' "$BASE/echo")"
+[[ "$echo_out" == "xff=[1.2.3.4, "* ]] || fail "default mode: expected legacy appended X-Forwarded-For, got: $echo_out"
+curl -ksi --max-time 15 "${CURL_CONNECT[@]}" "$BASE/ok" | tr -d '\r' | grep -qi '^alt-svc: h3=' \
+    || fail "default mode: Alt-Svc advertisement missing"
+echo "PASS: default mode unchanged (legacy X-Forwarded-For append, Alt-Svc present)"
+
+# PROXY protocol mode: two ingresses, one trusting the test client's source
+# range, one trusting an address nobody uses.
+PP_PORT="$((HOST_PORT + 1))"
+PPU_PORT="$((HOST_PORT + 2))"
+
+start_pp_ingress() {
+    local ctr="$1" port="$2" conf="$3"
+    docker run -d --name "$ctr" --network "$NET" -p "127.0.0.1:$port:8443" \
+        -v "$REPO_ROOT/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        -v "$WORK_DIR/$conf:/etc/nginx/conf.d/default.conf:ro" \
+        -v "$WORK_DIR/certs:/certs:ro" \
+        --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && exec nginx -g "daemon off;"' >/dev/null
+}
+start_pp_ingress "$PP_CTR" "$PP_PORT" tls-pp.conf
+start_pp_ingress "$PPU_CTR" "$PPU_PORT" tls-pp-untrusted.conf
+
+# pp_request <port> <proxy-line|v2|none> [<path>] -> prints the HTTP response
+# (status line + body) or "NO-RESPONSE". Sends the PROXY header (if any), then
+# TLS (SNI + Host = DOMAIN), then a request carrying spoofed forwarding headers.
+pp_request() {
+    python3 -I - "$1" "$2" "$DOMAIN" "${3:-/echo}" <<'PY'
+import socket, ssl, struct, sys
+port, mode, domain, path = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    if mode == "v2":
+        hdr = b"\r\n\r\n\x00\r\nQUIT\n" + b"\x21\x11" + struct.pack("!H", 12)
+        hdr += socket.inet_aton("198.51.100.7") + socket.inet_aton("10.0.0.1") + struct.pack("!HH", 40000, 8443)
+        s.sendall(hdr)
+    elif mode != "none":
+        s.sendall(mode.encode() + b"\r\n")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    t = ctx.wrap_socket(s, server_hostname=domain)
+    t.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nX-Forwarded-For: 1.2.3.4, 5.6.7.8\r\n"
+               "X-Real-IP: 9.9.9.9\r\nConnection: close\r\n\r\n" % (path, domain)).encode())
+    data = b""
+    while True:
+        c = t.recv(4096)
+        if not c:
+            break
+        data += c
+    text = data.decode("latin1").replace("\r", "")
+    print(text.split("\n", 1)[0], text.rsplit("\n\n", 1)[-1].strip())
+except Exception:
+    print("NO-RESPONSE")
+PY
+}
+
+for i in $(seq 1 30); do
+    [[ "$(pp_request "$PP_PORT" "PROXY TCP4 198.51.100.7 10.0.0.1 40000 8443" /nginx-health)" == *"200"* ]] && break
+    [[ "$i" == "30" ]] && { docker logs "$PP_CTR" >&2 || true; fail "PROXY protocol ingress did not become ready"; }
+    sleep 1
+done
+
+# Trusted source: the PROXY-header address wins, every caller-supplied value is
+# discarded (single value, no comma chain).
+got="$(pp_request "$PP_PORT" "PROXY TCP4 198.51.100.7 10.0.0.1 40000 8443")"
+[[ "$got" == *"xff=[198.51.100.7] rip=[198.51.100.7]"* ]] || fail "trusted v1 IPv4: got: $got"
+got="$(pp_request "$PP_PORT" "PROXY TCP6 2001:db8::7 2001:db8::1 40000 8443")"
+[[ "$got" == *"xff=[2001:db8::7] rip=[2001:db8::7]"* ]] || fail "trusted v1 IPv6: got: $got"
+got="$(pp_request "$PP_PORT" v2)"
+[[ "$got" == *"xff=[198.51.100.7] rip=[198.51.100.7]"* ]] || fail "trusted v2: got: $got"
+echo "PASS: trusted PROXY header sets X-Forwarded-For/X-Real-IP, spoofed values discarded (v1 IPv4, v1 IPv6, v2)"
+
+# No PROXY header at all: the listener requires one, so the connection is refused.
+got="$(pp_request "$PP_PORT" none)"
+[[ "$got" == "NO-RESPONSE" ]] || fail "connection without PROXY header should be refused, got: $got"
+echo "PASS: connection without a PROXY header is refused"
+
+# Untrusted source: a PROXY header is parsed but not honoured; neither the
+# claimed address nor the caller's values reach the backend.
+got="$(pp_request "$PPU_PORT" "PROXY TCP4 198.51.100.7 10.0.0.1 40000 8443")"
+[[ "$got" == *"200"* ]] || fail "untrusted-source request should still be served, got: $got"
+for bad in 198.51.100.7 1.2.3.4 5.6.7.8 9.9.9.9; do
+    [[ "$got" != *"$bad"* ]] || fail "untrusted PROXY source: $bad leaked to the backend: $got"
+done
+[[ "$got" =~ xff=\[([0-9.]+)\]\ rip=\[([0-9.]+)\] ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] \
+    || fail "untrusted PROXY source: expected a single TCP-peer address in both headers, got: $got"
+echo "PASS: PROXY header from an untrusted source is ignored (peer address used, nothing caller-supplied forwarded)"
+
+# PROXY mode serves no HTTP/3: no Alt-Svc, and nothing listens on UDP 8443.
+alt="$(python3 -I - "$PP_PORT" "$DOMAIN" <<'PY'
+import socket, ssl, sys
+port, domain = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+s.sendall(b"PROXY TCP4 198.51.100.7 10.0.0.1 40000 8443\r\n")
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+t = ctx.wrap_socket(s, server_hostname=domain)
+t.sendall(("GET /ok HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % domain).encode())
+d = b""
+while True:
+    c = t.recv(4096)
+    if not c: break
+    d += c
+print(d.decode("latin1").lower())
+PY
+)"
+[[ "$alt" == *"strict-transport-security"* ]] || fail "PROXY mode response lacks the security headers"
+[[ "$alt" != *"alt-svc"* ]] || fail "PROXY mode must not advertise Alt-Svc"
+udp="$(docker exec "$PP_CTR" sh -c 'cat /proc/net/udp /proc/net/udp6 2>/dev/null | awk "NR>1 && \$2 ~ /:20FB\$/"' || true)"
+[[ -z "$udp" ]] || fail "PROXY mode: something listens on UDP 8443: $udp"
+echo "PASS: PROXY mode has no Alt-Svc and no UDP 8443 listener"
 
 echo
 echo "All header tests passed."
