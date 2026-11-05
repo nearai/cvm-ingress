@@ -23,7 +23,25 @@ server {
     server_name _;
     ssl_reject_handshake on;
 
-    return 444;
+    # Parser errors can occur before nginx selects the matching Host server.
+    error_page 400 401 403 404 405 408 413 414 421 431 494 /__cvm_ingress_4xx;
+    error_page 497 =400 /__cvm_ingress_4xx;
+
+    location = /__cvm_ingress_4xx {
+        internal;
+        # Direct requests must keep the catch-all's close-connection contract.
+        error_page 404 = @reject;
+        default_type application/json;
+        return 200 '{"error":{"message":"The request could not be processed.","type":"invalid_request_error","param":null,"code":null}}';
+    }
+
+    location @reject {
+        return 444;
+    }
+
+    location / {
+        return 444;
+    }
 }
 
 server {

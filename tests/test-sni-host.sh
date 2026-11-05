@@ -216,6 +216,20 @@ expect_h2_421 "foreign Host HTTP/2" -H "Host: evil.example.com"
 expect_h2_421 "Host: localhost HTTP/2" -H "Host: localhost"
 expect_h2_421 "IP-literal Host HTTP/2" -H "Host: 203.0.113.7"
 
+# Internal error handlers must not turn foreign-Host requests into HTTP
+# responses, including encoded or normalized paths that select those handlers.
+RESERVED_PATHS=(
+    /__cvm_ingress_4xx /__cvm_ingress_5xx
+    /%5f%5fcvm_ingress_4xx /%5f%5fcvm_ingress_5xx
+    /probe/../__cvm_ingress_4xx /@reject
+)
+for path in "${RESERVED_PATHS[@]}"; do
+    expect_closed_h1 "foreign Host reserved path $path HTTP/1.1" \
+        --request-target "$path" -H "Host: evil.example.com"
+    expect_h2_421 "foreign Host reserved path $path HTTP/2" \
+        --request-target "$path" -H "Host: evil.example.com"
+done
+
 # --- 5. Plain (non-TLS) server: same Host allowlist ---------------------------
 
 out="$(curl -s --max-time 10 -H "Host: $DOMAIN" "http://127.0.0.1:$PLAIN_PORT/echo")" \
@@ -231,6 +245,16 @@ echo "PASS: plain foreign Host -> connection closed without response"
 rc=0; curl -s --max-time 10 -o /dev/null "http://127.0.0.1:$PLAIN_PORT/echo" || rc=$?
 [[ "$rc" == "52" ]] || fail "plain: IP-literal Host expected connection close (curl exit 52), got $rc"
 echo "PASS: plain IP-literal Host -> connection closed without response"
+
+for path in "${RESERVED_PATHS[@]}"; do
+    rc=0
+    code="$(curl -s --max-time 10 -H "Host: evil.example.com" --request-target "$path" \
+        -D "$WORK_DIR/closed-headers" -o "$WORK_DIR/closed-body" -w '%{http_code}' \
+        "http://127.0.0.1:$PLAIN_PORT/echo")" || rc=$?
+    [[ "$rc" == "52" && "$code" == "000" && ! -s "$WORK_DIR/closed-headers" && ! -s "$WORK_DIR/closed-body" ]] \
+        || fail "plain: foreign Host reserved path $path expected empty connection close, got exit $rc status $code"
+    echo "PASS: plain foreign Host reserved path $path -> connection closed without response"
+done
 
 hc="$(curl -s --max-time 10 "http://127.0.0.1:$PLAIN_PORT/nginx-health")"
 [[ "$hc" == "ok" ]] || fail "plain: /nginx-health by IP expected 'ok', got '$hc'"
