@@ -14,6 +14,9 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
 # nginx itself is provided by the upstream image (from nginx.org's repo) and
 # is intentionally NOT listed here — pinning it via Debian's archive would
 # downgrade it to 1.22.x which lacks --with-http_v3_module.
+# Snapshot CDN 503/504 bursts can outlast APT's default three retries. Allow
+# five retries, keep a 30s connection/data inactivity timeout, and fail if
+# any index is unavailable rather than proceeding with incomplete metadata.
 RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
     set -e; \
     echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
@@ -28,12 +31,16 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
             printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
         fi; \
     done < /tmp/pinned-packages.txt && \
-    apt-get update && \
+    apt-get -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        update --error-on=any && \
     # --allow-downgrades is necessary because the upstream nginx image ships
     # newer curl/libcurl4 (from nginx.org's mirrored debs) than the pinned
     # Debian snapshot. Pinning to the snapshot keeps the rest of userland
     # reproducible at the cost of one downgrade.
-    apt-get install -y --no-install-recommends --allow-downgrades \
+    apt-get -o Acquire::Retries=5 \
+        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends --allow-downgrades \
         bash \
         ca-certificates \
         openssl \
