@@ -15,12 +15,17 @@
 # SNI and Host, e.g.:
 #   curl -sk --connect-to ${DOMAIN}:443:127.0.0.1:<port> https://${DOMAIN}/nginx-health
 server {
-    listen 8443 ssl default_server;
-    listen [::]:8443 ssl default_server;
-    listen 8443 quic default_server;
-    listen [::]:8443 quic default_server;
+    listen 8443 ssl default_server${INGRESS_PP_LISTEN};
+    listen [::]:8443 ssl default_server${INGRESS_PP_LISTEN};
+    ${INGRESS_QUIC_OFF}listen 8443 quic default_server;
+    ${INGRESS_QUIC_OFF}listen [::]:8443 quic default_server;
 
     server_name _;
+    # PROXY protocol mode only (empty by default): trust the PROXY header
+    # solely from the configured REAL_IP_FROM source(s) and take the client
+    # address from it. Repeated in both server blocks so it holds whichever
+    # one nginx has selected when the connection is first processed.
+    ${INGRESS_REAL_IP_CONF}
     ssl_reject_handshake on;
 
     return 444;
@@ -28,18 +33,23 @@ server {
 
 server {
     # HTTP/1.1 + HTTP/2 over TCP.
-    listen 8443 ssl;
-    listen [::]:8443 ssl;
+    listen 8443 ssl${INGRESS_PP_LISTEN};
+    listen [::]:8443 ssl${INGRESS_PP_LISTEN};
     # HTTP/3 over QUIC (UDP). `reuseport` enables per-worker socket sharding;
     # it is a socket-level option and may only appear on one listen directive
     # per address:port, so the catch-all above does not repeat it.
-    listen 8443 quic reuseport;
-    listen [::]:8443 quic reuseport;
+    ${INGRESS_QUIC_OFF}listen 8443 quic reuseport;
+    ${INGRESS_QUIC_OFF}listen [::]:8443 quic reuseport;
 
     http2 on;
-    http3 on;
+    ${INGRESS_QUIC_OFF}http3 on;
 
     server_name ${DOMAIN};
+    # PROXY protocol mode only (empty by default): trust the PROXY header
+    # solely from the configured REAL_IP_FROM source(s) and take the client
+    # address from it. Repeated in both server blocks so it holds whichever
+    # one nginx has selected when the connection is first processed.
+    ${INGRESS_REAL_IP_CONF}
 
     ssl_certificate /certs/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /certs/${DOMAIN}/privkey.pem;
@@ -54,7 +64,7 @@ server {
     # Advertise HTTP/3 to compliant clients. Browsers will only upgrade if the
     # UDP path actually works; otherwise they fall back to HTTP/2 silently.
     # ma=86400 = cache the advertisement for 24h once verified.
-    add_header Alt-Svc 'h3=":8443"; ma=86400' always;
+    ${INGRESS_QUIC_OFF}add_header Alt-Svc 'h3=":8443"; ma=86400' always;
 
     # Security headers (nearai/infra#196). `always` attaches them to every
     # response status, including proxied 4xx/5xx and locally generated errors.
@@ -126,7 +136,12 @@ server {
         # pin makes the value deterministic (no port suffix, no case variants).
         proxy_set_header Host ${DOMAIN};
         proxy_set_header X-Real-IP ${DOLLAR}remote_addr;
-        proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
+        # PROXY protocol mode: both headers are overwritten with the address
+        # recovered from the PROXY header (the realip-rewritten client address); any
+        # caller-supplied X-Forwarded-For / X-Real-IP is discarded. Default
+        # mode keeps the legacy append behaviour (the commented-out toggle).
+        ${INGRESS_XFF_LEGACY_OFF}proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
+        ${INGRESS_XFF_CONF}
         proxy_set_header X-Forwarded-Proto ${DOLLAR}scheme;
         proxy_set_header Early-Data ${DOLLAR}ssl_early_data;
         proxy_http_version 1.1;
