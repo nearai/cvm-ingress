@@ -12,7 +12,7 @@
 #   INGRESS_XFF_LEGACY_OFF "#" prefix that comments out the pass-through
 #                         X-Forwarded-For line
 #   INGRESS_REAL_IP_CONF  set_real_ip_from/real_ip_header directives
-#   INGRESS_XFF_CONF      X-Forwarded-For / X-Real-IP overwrite from $remote_addr
+#   INGRESS_XFF_CONF      X-Forwarded-For overwrite from the client address, Forwarded blanked
 #
 # REAL_IP_FROM is a comma/space separated list of IPs or CIDRs. Wildcards that
 # would trust every peer (/0, 0.0.0.0, ::) are refused: the header is trusted
@@ -42,7 +42,10 @@ derive_proxy_protocol_vars() {
     export INGRESS_QUIC_OFF="#"
     export INGRESS_XFF_LEGACY_OFF="#"
     export INGRESS_REAL_IP_CONF="${conf}real_ip_header proxy_protocol;"
-    export INGRESS_XFF_CONF='proxy_set_header X-Forwarded-For $remote_addr;'
+    # Forwarded (RFC 7239) is blanked too: chat-api falls back to it when
+    # X-Forwarded-For does not parse, so a caller-supplied copy must not survive.
+    export INGRESS_XFF_CONF='proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Forwarded "";'
 }
 
 validate_env() {

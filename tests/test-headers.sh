@@ -190,6 +190,8 @@ for f in tls-pp default-pp; do
         || fail "$f: caller-appending X-Forwarded-For still active"
     grep -Eq '^[[:space:]]*proxy_set_header X-Forwarded-For \$remote_addr;' "$WORK_DIR/$f.conf" \
         || fail "$f: X-Forwarded-For is not overwritten with the client address"
+    grep -Eq '^[[:space:]]*proxy_set_header Forwarded "";' "$WORK_DIR/$f.conf" \
+        || fail "$f: caller-supplied Forwarded header is not blanked"
     grep -Eq '^[[:space:]]*proxy_set_header X-Real-IP \$remote_addr;' "$WORK_DIR/$f.conf" \
         || fail "$f: X-Real-IP is not set from the client address"
 done
@@ -253,7 +255,7 @@ server {
     location = /redirect { return 301 /ok; }
     # Echo what the ingress forwards: used by the PROXY protocol tests.
     location = /echo {
-        return 200 "xff=[$http_x_forwarded_for] rip=[$http_x_real_ip] peer=[$remote_addr]\n";
+        return 200 "xff=[$http_x_forwarded_for] rip=[$http_x_real_ip] peer=[$remote_addr] fwd=[$http_forwarded]\n";
     }
     location = /dup {
         add_header Strict-Transport-Security "max-age=1" always;
@@ -399,7 +401,7 @@ try:
     ctx.verify_mode = ssl.CERT_NONE
     t = ctx.wrap_socket(s, server_hostname=domain)
     t.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nX-Forwarded-For: 1.2.3.4, 5.6.7.8\r\n"
-               "X-Real-IP: 9.9.9.9\r\nConnection: close\r\n\r\n" % (path, domain)).encode())
+               "X-Real-IP: 9.9.9.9\r\nForwarded: for=8.8.8.8\r\nConnection: close\r\n\r\n" % (path, domain)).encode())
     data = b""
     while True:
         c = t.recv(4096)
@@ -427,7 +429,8 @@ got="$(pp_request "$PP_PORT" "PROXY TCP6 2001:db8::7 2001:db8::1 40000 8443")"
 [[ "$got" == *"xff=[2001:db8::7] rip=[2001:db8::7]"* ]] || fail "trusted v1 IPv6: got: $got"
 got="$(pp_request "$PP_PORT" v2)"
 [[ "$got" == *"xff=[198.51.100.7] rip=[198.51.100.7]"* ]] || fail "trusted v2: got: $got"
-echo "PASS: trusted PROXY header sets X-Forwarded-For/X-Real-IP, spoofed values discarded (v1 IPv4, v1 IPv6, v2)"
+[[ "$got" == *"fwd=[]"* ]] || fail "trusted v2: caller-supplied Forwarded header reached the backend: $got"
+echo "PASS: trusted PROXY header sets X-Forwarded-For/X-Real-IP, spoofed values and Forwarded discarded (v1 IPv4, v1 IPv6, v2)"
 
 # No PROXY header at all: the listener requires one, so the connection is refused.
 got="$(pp_request "$PP_PORT" none)"
@@ -438,7 +441,7 @@ echo "PASS: connection without a PROXY header is refused"
 # claimed address nor the caller's values reach the backend.
 got="$(pp_request "$PPU_PORT" "PROXY TCP4 198.51.100.7 10.0.0.1 40000 8443")"
 [[ "$got" == *"200"* ]] || fail "untrusted-source request should still be served, got: $got"
-for bad in 198.51.100.7 1.2.3.4 5.6.7.8 9.9.9.9; do
+for bad in 198.51.100.7 1.2.3.4 5.6.7.8 9.9.9.9 8.8.8.8; do
     [[ "$got" != *"$bad"* ]] || fail "untrusted PROXY source: $bad leaked to the backend: $got"
 done
 [[ "$got" =~ xff=\[([0-9.]+)\]\ rip=\[([0-9.]+)\] ]] && [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] \
