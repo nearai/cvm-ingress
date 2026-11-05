@@ -121,10 +121,13 @@ docker run -d --name "$TLS_CTR" --network "$NET" \
     --entrypoint sh "$IMAGE" -c 'mkdir -p /run/nginx && exec nginx -g "daemon off;"' >/dev/null
 
 PLAIN="http://127.0.0.1:$PLAIN_PORT"
-TLS="https://127.0.0.1:$TLS_PORT"
+# Present the configured DOMAIN as both SNI and Host: the TLS listener
+# intentionally rejects unknown/empty SNI and foreign Hosts.
+TLS="https://$DOMAIN:$TLS_PORT"
+CONNECT=(--connect-to "$DOMAIN:$TLS_PORT:127.0.0.1:$TLS_PORT")
 for i in $(seq 1 30); do
     if [[ "$(curl -s --max-time 2 "$PLAIN/nginx-health" || true)" == *ok* ]] &&
-        [[ "$(curl -ks --max-time 2 "$TLS/nginx-health" || true)" == *ok* ]]; then
+        [[ "$(curl -ks --max-time 2 "${CONNECT[@]}" "$TLS/nginx-health" || true)" == *ok* ]]; then
         break
     fi
     if [[ "$i" == "30" ]]; then
@@ -181,7 +184,7 @@ assert_generic "plain: oversized Content-Length (413)" \
     "$(raw_request "$PLAIN_PORT" "POST / HTTP/1.1\r\nHost: $DOMAIN\r\nContent-Length: 209715201\r\nConnection: close\r\n\r\n")" 413
 
 assert_generic "plain: 20k-char URI (414)" \
-    "$(curl -si --max-time 15 "$PLAIN$LONG_PATH" | tr -d '\r')" 414
+    "$(curl -si --max-time 15 -H "Host: $DOMAIN" "$PLAIN$LONG_PATH" | tr -d '\r')" 414
 
 # --- TLS listener: nginx-generated errors -------------------------------------
 
@@ -192,13 +195,18 @@ assert_generic "tls: plain HTTP to TLS port (497 remap)" \
 # error, no HTTP response to assert on), so pin HTTP/1.1 to exercise the
 # listener's error_page path.
 assert_generic "tls: 20k-char URI (414, HTTP/1.1)" \
-    "$(curl -ksi --http1.1 --max-time 15 "$TLS$LONG_PATH" | tr -d '\r')" 414
+    "$(curl -ksi --http1.1 --max-time 15 "${CONNECT[@]}" "$TLS$LONG_PATH" | tr -d '\r')" 414
 
 # --- Backend-produced errors still pass through byte-for-byte -----------------
 
-for base_label in "plain|$PLAIN|" "tls|$TLS|-k"; do
-    IFS='|' read -r label base kflag <<<"$base_label"
-    raw="$(curl -si $kflag --max-time 15 "$base/missing" | tr -d '\r')"
+for label in plain tls; do
+    base="$PLAIN"
+    curl_args=(-H "Host: $DOMAIN")
+    if [[ "$label" == "tls" ]]; then
+        base="$TLS"
+        curl_args=(-k "${CONNECT[@]}")
+    fi
+    raw="$(curl -si "${curl_args[@]}" --max-time 15 "$base/missing" | tr -d '\r')"
     read -r _ status _ <<<"$raw"
     [[ "$status" == "404" ]] || fail "$label: backend 404 expected, got $status"
     body="$(printf '%s' "$raw" | tail -n1)"
@@ -213,7 +221,7 @@ sleep 6  # let the 5s resolver cache expire so the failure path is exercised
 
 out_file="$WORK_DIR/backend-down.out"
 set +e
-curl -s --max-time 15 -o "$out_file" "$PLAIN/ok"
+curl -s --max-time 15 -H "Host: $DOMAIN" -o "$out_file" "$PLAIN/ok"
 rc=$?
 set -e
 # 52 = empty reply, 56 = connection reset: both mean nginx closed the

@@ -146,12 +146,19 @@ expect_proxied() {
 
 # expect_closed_h1 <label> [extra curl args...]
 # HTTP/1.1 request whose connection must be closed without an HTTP response
-# (444): curl exits 52 "empty reply from server".
+# (444): curl reports either an empty reply (52) or a receive error (56),
+# depending on how its TLS library handles the close. Neither may include
+# an HTTP status, response headers, or body.
 expect_closed_h1() {
     local label=$1; shift
-    local rc=0
-    curl -ks --http1.1 --max-time 10 "${CONNECT[@]}" "$@" -o /dev/null "$TLS_BASE/echo" || rc=$?
-    [[ "$rc" == "52" ]] || fail "$label: expected connection close (curl exit 52), got exit $rc"
+    local rc=0 code
+    code="$(curl -ks --http1.1 --max-time 10 "${CONNECT[@]}" "$@" \
+        -D "$WORK_DIR/closed-headers" -o "$WORK_DIR/closed-body" \
+        -w '%{http_code}' "$TLS_BASE/echo")" || rc=$?
+    [[ "$rc" == "52" || "$rc" == "56" ]] \
+        || fail "$label: expected connection close (curl exit 52/56), got exit $rc"
+    [[ "$code" == "000" && ! -s "$WORK_DIR/closed-headers" && ! -s "$WORK_DIR/closed-body" ]] \
+        || fail "$label: expected no HTTP status, response headers, or body (status $code)"
     echo "PASS: $label -> connection closed without response"
 }
 
