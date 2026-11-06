@@ -1,3 +1,8 @@
+# PENDING PUBLICATION: locally assembled digest; anonymous pull is not verified.
+FROM nearaidev/apt-bundle-cvm-ingress@sha256:5fb4259e59100090207fc914879aba8c3a75b6d72e48670c47a3dff1c6a21623 AS apt-bundle
+FROM scratch AS apt-bundle-files
+COPY --from=apt-bundle /apt-bundle /apt-bundle
+
 # Upstream nginx 1.29 on Debian Bookworm. Compiled with --with-http_v3_module
 # (verify: docker run --rm nginx:1.29-bookworm nginx -V 2>&1 | grep http_v3_module).
 # Pinned to the multi-platform index digest published 2025-09-29.
@@ -7,40 +12,33 @@ ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     DEBIAN_FRONTEND=noninteractive
 
-# Install userland tooling from the pinned Debian snapshot.
+# Install userland tooling offline from the signed, pinned Debian snapshot.
 # (ca-certificates is already present in the upstream nginx image at the
 # version pinned below, so we do NOT run a bootstrap apt-get against live
 # repos — that would drift whenever upstream republishes the package.)
 # nginx itself is provided by the upstream image (from nginx.org's repo) and
 # is intentionally NOT listed here — pinning it via Debian's archive would
 # downgrade it to 1.22.x which lacks --with-http_v3_module.
-# Snapshot CDN 503/504 bursts can outlast APT's default three retries. Allow
-# five retries, keep a 30s connection/data inactivity timeout, and fail if
-# any index is unavailable rather than proceeding with incomplete metadata.
-RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
+# The helper is reviewed source; trust roots come from the pinned base image.
+RUN --network=none \
+    --mount=type=bind,from=apt-bundle-files,source=/apt-bundle,target=/opt/apt-bundle,ro \
+    --mount=type=bind,source=build/apt-bundle/prepare-apt.sh,target=/run/prepare-apt.sh,ro \
+    --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
     set -e; \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20250411T024939Z bookworm-security main' >> /etc/apt/sources.list && \
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
-    rm -rf /etc/apt/sources.list.d/* && \
-    mkdir -p /etc/apt/preferences.d && \
-    while IFS= read -r line; do \
-        pkg=$(echo "$line" | cut -d= -f1); \
-        ver=$(echo "$line" | cut -d= -f2-); \
-        if [ -n "$pkg" ] && [ -n "$ver" ] && [ "$pkg" != "$ver" ]; then \
-            printf "Package: %s\nPin: version %s\nPin-Priority: 1001\n\n" "$pkg" "$ver" >> /etc/apt/preferences.d/pinned-packages; \
-        fi; \
-    done < /tmp/pinned-packages.txt && \
-    apt-get -o Acquire::Retries=5 \
-        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-        update --error-on=any && \
+    bash /run/prepare-apt.sh --bundle /opt/apt-bundle \
+        --snapshot 20250411T024939Z --config /tmp/apt-bundle.conf \
+        --debian-keyring /usr/share/keyrings/debian-archive-keyring.gpg \
+        --status /var/lib/dpkg/status --pins /tmp/pinned-packages.txt && \
+    if [ -f /var/lib/apt/extended_states ]; then \
+        cp /var/lib/apt/extended_states /tmp/apt-bundle.conf.d/state/extended_states; \
+    fi && \
+    export APT_CONFIG=/tmp/apt-bundle.conf && \
+    apt-get update --error-on=any && \
     # --allow-downgrades is necessary because the upstream nginx image ships
     # newer curl/libcurl4 (from nginx.org's mirrored debs) than the pinned
     # Debian snapshot. Pinning to the snapshot keeps the rest of userland
     # reproducible at the cost of one downgrade.
-    apt-get -o Acquire::Retries=5 \
-        -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-        install -y --no-install-recommends --allow-downgrades \
+    apt-get install -y --no-install-recommends --allow-downgrades \
         bash \
         ca-certificates \
         openssl \
@@ -50,7 +48,9 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
         certbot \
         python3-certbot-dns-cloudflare \
         awscli && \
-    rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
+    cp /tmp/apt-bundle.conf.d/state/extended_states /var/lib/apt/extended_states && \
+    rm -rf /tmp/apt-bundle.conf /tmp/apt-bundle.conf.d \
+        /var/lib/apt/lists/* /var/log/* /var/cache/ldconfig/aux-cache
 
 RUN mkdir -p /certs /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /var/log/nginx /run/nginx && \
     chown -R www-data:www-data /certs /run/nginx

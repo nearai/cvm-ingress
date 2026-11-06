@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Single-source the nginx base image from the Dockerfile so this test always
 # exercises the same binary the image ships.
-BASE_IMAGE=$(awk '/^FROM /{print $2; exit}' "$SCRIPT_DIR/Dockerfile")
+BASE_IMAGE=$(awk '/^FROM[[:space:]]+nginx/ {print $2; exit}' "$SCRIPT_DIR/Dockerfile")
 [[ -n "$BASE_IMAGE" ]] || { echo "FAIL: could not read base image from Dockerfile" >&2; exit 1; }
 echo "Using base image: $BASE_IMAGE"
 

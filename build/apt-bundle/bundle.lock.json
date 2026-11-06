@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "component": "cvm-ingress",
+  "snapshot": "20250411T024939Z",
+  "architecture": "amd64",
+  "image": "nearaidev/apt-bundle-cvm-ingress@sha256:5fb4259e59100090207fc914879aba8c3a75b6d72e48670c47a3dff1c6a21623",
+  "debian_manifest": "debian-packages.txt",
+  "docker_manifest": null,
+  "upstream_base_head": "c459dff064f056351ec2849bda47d7d4ddbfebc9",
+  "publication_pending": true,
+  "helper_pending": false,
+  "helper_sha256": "20d710d30ff44ac93325a7c686366bdc110160c873409dc69affb9bded71eb34"
+}
