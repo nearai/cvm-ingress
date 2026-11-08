@@ -18,7 +18,13 @@
 #   4. a client-controlled field (User-Agent) cannot forge the audit field:
 #      its quotes are escaped and the end-anchored field holds the backend's ID;
 #   5. every pre-existing field keeps its order and format; responses (status,
-#      body, audit header) and forwarded request headers are unchanged.
+#      body, audit header) and forwarded request headers are unchanged;
+#   6. credentials never reach the log: the request path and Referer are
+#      logged without their query string or fragment, the Basic auth user is
+#      logged as "-", and a path or Referer holding a credential-shaped token
+#      is logged as "[redacted]";
+#   7. the error log, run through the image's real entrypoint, keeps nginx's
+#      message but loses query strings and credential-shaped tokens.
 #
 # Runs against the image built from this repo's Dockerfile, using the image's
 # own /etc/nginx/nginx.conf and templates rendered like entrypoint.sh.
@@ -48,11 +54,13 @@ NET="audit-net-$$"
 BACKEND_CTR="audit-backend-$$"
 TLS_CTR="audit-tls-$$"
 PLAIN_CTR="audit-plain-$$"
+ENTRY_CTR="audit-entrypoint-$$"
 TLS_PORT="$((20000 + RANDOM % 10000))"
 PLAIN_PORT="$((30000 + RANDOM % 10000))"
+ENTRY_PORT="$((40000 + RANDOM % 10000))"
 
 cleanup() {
-    docker rm -f "$BACKEND_CTR" "$TLS_CTR" "$PLAIN_CTR" >/dev/null 2>&1 || true
+    docker rm -f "$BACKEND_CTR" "$TLS_CTR" "$PLAIN_CTR" "$ENTRY_CTR" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
     rm -rf "$WORK_DIR"
 }
@@ -179,13 +187,15 @@ echo "PASS: nginx -t on the image's nginx.conf with both rendered templates (tls
 ENTRY_RE='^[^ ]+ - [^ ]+ \[[^]]+\] "([^"]*)" ([0-9]{3}) ([0-9]+) "[^"]*" "[^"]*" "[^"]*" rt=[0-9.]+ uct=([0-9.]+|-) urt=([0-9.]+|-) admin_audit_request_id="([^"]*)"$'
 
 # send <container> <probe> <url> [curl args...]
-# Sends one request tagged ?probe=<probe>. Sets STATUS, BYTES, HEADERS (CRs
-# stripped) and BODY as the client saw them, and ENTRY to the single
-# access-log line <container> wrote for it.
+# Sends one request to <url>?probe=<probe> with X-Forwarded-For: probe-<probe>.
+# The query string is not logged, so the entry is found by the X-Forwarded-For
+# field. Sets STATUS, BYTES, HEADERS (CRs stripped) and BODY as the client saw
+# them, and ENTRY to the single access-log line <container> wrote for it.
 send() {
     local ctr=$1 probe=$2 url=$3 meta
     shift 3
     meta="$(curl -ks --max-time 10 -A "$UA" -D "$WORK_DIR/headers" -o "$WORK_DIR/body" \
+        -H "X-Forwarded-For: probe-$probe" \
         -w '%{http_code} %{size_download}' "$@" "$url?probe=$probe")" \
         || fail "$probe: request failed"
     read -r STATUS BYTES <<<"$meta"
@@ -193,7 +203,7 @@ send() {
     BODY="$(cat "$WORK_DIR/body")"
     ENTRY=""
     for _ in $(seq 1 50); do
-        ENTRY="$(docker logs "$ctr" 2>/dev/null | grep -F "?probe=$probe " || true)"
+        ENTRY="$(docker logs "$ctr" 2>/dev/null | grep -F "\"probe-$probe\" rt=" || true)"
         [[ -n "$ENTRY" ]] && break
         sleep 0.1
     done
@@ -231,7 +241,7 @@ expect_entry() {
 # --- 1. Client-supplied IDs never become the logged audit ID ------------------
 
 send "$TLS_CTR" tls-h1 "$TLS_BASE/v1/admin/organizations" --http1.1 "${CONNECT[@]}" "${CLIENT_HEADERS[@]}"
-expect_entry "tls HTTP/1.1 admin" 200 "GET /v1/admin/organizations?probe=tls-h1 HTTP/1.1" "$SERVER_ID" yes
+expect_entry "tls HTTP/1.1 admin" 200 "GET /v1/admin/organizations HTTP/1.1" "$SERVER_ID" yes
 
 # Response and request behavior are unchanged: the client still receives the
 # backend's header and body, and the backend still receives the client's
@@ -243,29 +253,29 @@ expect_entry "tls HTTP/1.1 admin" 200 "GET /v1/admin/organizations?probe=tls-h1 
 echo "PASS: tls HTTP/1.1 response passes through; client headers still forwarded as sent"
 
 send "$TLS_CTR" tls-h2 "$TLS_BASE/v1/admin/organizations" --http2 "${CONNECT[@]}" "${CLIENT_HEADERS[@]}"
-expect_entry "tls HTTP/2 admin" 200 "GET /v1/admin/organizations?probe=tls-h2 HTTP/2.0" "$SERVER_ID" yes
+expect_entry "tls HTTP/2 admin" 200 "GET /v1/admin/organizations HTTP/2.0" "$SERVER_ID" yes
 
 send "$PLAIN_CTR" plain "$PLAIN_BASE/v1/admin/organizations" -H "Host: $DOMAIN" "${CLIENT_HEADERS[@]}"
-expect_entry "plain admin" 200 "GET /v1/admin/organizations?probe=plain HTTP/1.1" "$SERVER_ID" yes
+expect_entry "plain admin" 200 "GET /v1/admin/organizations HTTP/1.1" "$SERVER_ID" yes
 
 # --- 2. Denial: backend ID logged with the denial's status and size -----------
 
 send "$TLS_CTR" denied "$TLS_BASE/v1/admin/users" --http1.1 "${CONNECT[@]}" "${CLIENT_HEADERS[@]}"
-expect_entry "tls admin denial" 403 "GET /v1/admin/users?probe=denied HTTP/1.1" "$SERVER_DENIED_ID" yes
+expect_entry "tls admin denial" 403 "GET /v1/admin/users HTTP/1.1" "$SERVER_DENIED_ID" yes
 [[ "$BODY" == "$DENIED_BODY" ]] || fail "denied: backend 403 envelope was rewritten: $BODY"
 
 # --- 3. Missing and empty values are unambiguous ------------------------------
 
 # The backend sends no audit header; the client's must not fill the gap.
 send "$TLS_CTR" no-header "$TLS_BASE/v1/models" --http1.1 "${CONNECT[@]}" "${CLIENT_HEADERS[@]}"
-expect_entry "tls non-admin, no audit header" 200 "GET /v1/models?probe=no-header HTTP/1.1" "-" yes
+expect_entry "tls non-admin, no audit header" 200 "GET /v1/models HTTP/1.1" "-" yes
 
 send "$TLS_CTR" blank "$TLS_BASE/v1/admin/blank" --http1.1 "${CONNECT[@]}"
-expect_entry "tls admin, empty audit header" 200 "GET /v1/admin/blank?probe=blank HTTP/1.1" "" yes
+expect_entry "tls admin, empty audit header" 200 "GET /v1/admin/blank HTTP/1.1" "" yes
 
 # Answered by nginx itself: no upstream at all.
 send "$TLS_CTR" health "$TLS_BASE/nginx-health" --http1.1 "${CONNECT[@]}" "${CLIENT_HEADERS[@]}"
-expect_entry "tls /nginx-health, no backend" 200 "GET /nginx-health?probe=health HTTP/1.1" "-" no
+expect_entry "tls /nginx-health, no backend" 200 "GET /nginx-health HTTP/1.1" "-" no
 
 # --- 4. A client-controlled field cannot forge the audit field ----------------
 
@@ -278,6 +288,115 @@ send "$TLS_CTR" forged-ua "$TLS_BASE/v1/admin/organizations" --http1.1 "${CONNEC
 [[ "$(grep -o 'admin_audit_request_id="' <<<"$ENTRY" | wc -l | tr -d ' ')" == "1" ]] \
     || fail "forged-ua: more than one unescaped admin_audit_request_id=\" in the entry: $ENTRY"
 echo "PASS: forged User-Agent is escaped; the end-anchored field holds the backend's ID"
+
+# --- 5. Credentials in URLs and Basic auth are never logged -------------------
+
+# Random values in the shape of real credentials, generated per run.
+FAKE_KEY="sk-$(openssl rand -hex 16)"
+FAKE_ADMIN="adm_$(openssl rand -hex 16)"
+FAKE_SESSION="sess_$(openssl rand -hex 16)"
+FAKE_JWT="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.$(openssl rand -hex 8)"
+# Group 1: Referer field.
+REFERER_RE='^[^ ]+ - - \[[^]]+\] "[^"]*" [0-9]{3} [0-9]+ "([^"]*)"'
+
+# expect_no_secrets <label>: ENTRY holds none of the fake credentials.
+expect_no_secrets() {
+    local label=$1 secret
+    for secret in "$FAKE_KEY" "$FAKE_ADMIN" "$FAKE_SESSION" "$FAKE_JWT"; do
+        [[ "$ENTRY" != *"$secret"* ]] || fail "$label: a credential reached the access log: $ENTRY"
+    done
+}
+
+# expect_referer <label> <referer field>
+expect_referer() {
+    local label=$1 want=$2
+    [[ "$ENTRY" =~ $REFERER_RE ]] || fail "$label: unexpected access-log format: $ENTRY"
+    [[ "${BASH_REMATCH[1]}" == "$want" ]] \
+        || fail "$label: logged Referer '${BASH_REMATCH[1]}', expected '$want'"
+    echo "PASS: $label -> Referer logged as \"$want\""
+}
+
+send "$TLS_CTR" cred-query "$TLS_BASE/v1/models" --http1.1 "${CONNECT[@]}" \
+    -G --data-urlencode "api_key=$FAKE_KEY" --data-urlencode "token=$FAKE_SESSION"
+expect_entry "credentials in the query string" 200 "GET /v1/models HTTP/1.1" "-" yes
+expect_referer "no Referer" "-"
+expect_no_secrets "credentials in the query string"
+
+send "$TLS_CTR" cred-basic "$TLS_BASE/v1/models" --http1.1 "${CONNECT[@]}" -u "$FAKE_KEY:"
+expect_entry "API key as the Basic auth user" 200 "GET /v1/models HTTP/1.1" "-" yes
+[[ "$ENTRY" == *" - - ["* ]] || fail "cred-basic: expected '-' for the auth user: $ENTRY"
+expect_no_secrets "API key as the Basic auth user"
+
+send "$TLS_CTR" cred-path "$TLS_BASE/v1,api_key=$FAKE_KEY,model=test" --http1.1 "${CONNECT[@]}"
+expect_entry "API key inside the path" 200 "GET [redacted] HTTP/1.1" "-" yes
+expect_no_secrets "API key inside the path"
+
+send "$TLS_CTR" cred-path-hyphen "$TLS_BASE/v1/key-$FAKE_KEY" --http1.1 "${CONNECT[@]}"
+expect_entry "API key after a hyphen in the path" 200 "GET [redacted] HTTP/1.1" "-" yes
+expect_no_secrets "API key after a hyphen in the path"
+
+send "$TLS_CTR" cred-path-encoded "$TLS_BASE/v1/x%3D$FAKE_ADMIN" --http1.1 "${CONNECT[@]}"
+expect_entry "percent-encoded admin token in the path" 200 "GET [redacted] HTTP/1.1" "-" yes
+expect_no_secrets "percent-encoded admin token in the path"
+
+send "$TLS_CTR" cred-path-jwt "$TLS_BASE/v1/session/$FAKE_JWT" --http1.1 "${CONNECT[@]}"
+expect_entry "JWT in the path" 200 "GET [redacted] HTTP/1.1" "-" yes
+expect_no_secrets "JWT in the path"
+
+send "$TLS_CTR" cred-referer-query "$TLS_BASE/v1/models" --http1.1 "${CONNECT[@]}" \
+    -e "https://app.example.invalid/settings?api_key=$FAKE_KEY#frag"
+expect_entry "credential in the Referer query" 200 "GET /v1/models HTTP/1.1" "-" yes
+expect_referer "credential in the Referer query" "https://app.example.invalid/settings"
+expect_no_secrets "credential in the Referer query"
+
+send "$TLS_CTR" cred-referer-path "$TLS_BASE/v1/models" --http1.1 "${CONNECT[@]}" \
+    -e "https://app.example.invalid/v1,api_key=$FAKE_KEY"
+expect_referer "credential in the Referer path" "[redacted]"
+expect_no_secrets "credential in the Referer path"
+
+# Look-alikes stay readable: "task-..." is not an API key.
+send "$TLS_CTR" lookalike "$TLS_BASE/v1/tasks/task-0123456789abcdef0123" --http1.1 "${CONNECT[@]}" \
+    -e "https://app.example.invalid/tasks/task-0123456789abcdef0123"
+expect_entry "API-key look-alike in the path" 200 "GET /v1/tasks/task-0123456789abcdef0123 HTTP/1.1" "-" yes
+expect_referer "API-key look-alike in the Referer" "https://app.example.invalid/tasks/task-0123456789abcdef0123"
+
+# --- 6. The error log keeps its detail but not the credentials ----------------
+# nginx quotes the request line, upstream URL and Referer in error messages.
+# Start the image through its real entrypoint (plain mode) with an unreachable
+# backend, so every proxied request writes a connect() error.
+
+docker run -d --name "$ENTRY_CTR" -e DOMAIN="$DOMAIN" -e BACKEND_HOST=127.0.0.1 -e BACKEND_PORT=9 \
+    -p "127.0.0.1:$ENTRY_PORT:8443" "$IMAGE" >/dev/null
+ENTRY_BASE="http://127.0.0.1:$ENTRY_PORT"
+for i in $(seq 1 30); do
+    [[ "$(curl -s --max-time 2 "$ENTRY_BASE/nginx-health" || true)" == "ok" ]] && break
+    [[ "$i" == "30" ]] && { docker logs "$ENTRY_CTR" >&2 || true; fail "entrypoint container did not become ready"; }
+    sleep 1
+done
+
+curl -s --max-time 5 -o /dev/null -H "Host: $DOMAIN" \
+    -e "https://app.example.invalid/settings?token=$FAKE_SESSION" \
+    "$ENTRY_BASE/v1/models?api_key=$FAKE_KEY&probe=error-log" || true
+curl -s --max-time 5 -o /dev/null -H "Host: $DOMAIN" \
+    "$ENTRY_BASE/v1,api_key=$FAKE_ADMIN,model=test" || true
+
+ERROR_LOG=""
+for _ in $(seq 1 50); do
+    ERROR_LOG="$(docker logs "$ENTRY_CTR" 2>&1 >/dev/null | grep -F 'connect() failed' || true)"
+    [[ "$(grep -c . <<<"$ERROR_LOG")" -ge 2 ]] && break
+    sleep 0.1
+done
+[[ "$(grep -c . <<<"$ERROR_LOG")" -ge 2 ]] \
+    || fail "error log: expected two connect() errors on stderr, got: $ERROR_LOG"
+grep -qE '^[0-9/]+ [0-9:]+ \[error\] [0-9]+#[0-9]+: \*[0-9]+ connect\(\) failed' <<<"$ERROR_LOG" \
+    || fail "error log: nginx's line prefix was altered: $ERROR_LOG"
+for want in 'request: "GET /v1/models HTTP/1.1"' 'upstream: "http://127.0.0.1:9/v1/models"' \
+    'referrer: "https://app.example.invalid/settings"' 'request: "GET /v1,api_key=[redacted],model=test HTTP/1.1"'; do
+    grep -qF "$want" <<<"$ERROR_LOG" || fail "error log: missing '$want' in: $ERROR_LOG"
+done
+ENTRY="$(docker logs "$ENTRY_CTR" 2>&1)"
+expect_no_secrets "error log"
+echo "PASS: error log keeps nginx's detail; query strings and tokens are removed"
 
 echo
 echo "All admin audit log tests passed."

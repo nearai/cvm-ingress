@@ -122,7 +122,10 @@ main() {
     fi
 
     log_info "Starting nginx"
-    exec nginx -g "daemon off;"
+    # nginx's error log (stderr) quotes request and upstream URLs with their
+    # query strings; filter it so credentials never leave the container.
+    exec nginx -g "daemon off;" \
+        2> >(exec sed -u -E -f "$SCRIPT_DIR/nginx/redact-error-log.sed" >&2)
 }
 
 main "$@"
