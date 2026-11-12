@@ -79,6 +79,8 @@ RUN rm -rf \
 # 8443/udp: HTTP/3 (QUIC over UDP). Documentation-only — the actual host-level
 # UDP path (cpu01/cpu02 L4 nginx + QEMU SLIRP hostfwd) is not wired up yet.
 # See the PR description for the deployment blockers.
+# With PROXY_PROTOCOL=true there is no UDP listener at all (QUIC cannot carry
+# a PROXY header); only 8443/tcp is served, and it requires a PROXY header.
 EXPOSE 8443/tcp 8443/udp
 
 # Override the upstream nginx image's entrypoint/cmd. Upstream defaults to
