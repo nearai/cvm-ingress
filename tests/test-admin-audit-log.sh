@@ -25,6 +25,8 @@
 #      is logged as "[redacted]";
 #   7. the error log, run through the image's real entrypoint, keeps nginx's
 #      message but loses query strings and credential-shaped tokens.
+#   8. the field after the User-Agent is "-" or a fixed marker, and the
+#      backend receives its request headers unchanged.
 #
 # Runs against the image built from this repo's Dockerfile, using the image's
 # own /etc/nginx/nginx.conf and templates rendered like entrypoint.sh.
@@ -115,6 +117,10 @@ server {
         add_header x-admin-audit-request-id " " always;
         return 200 '{"ok":true}';
     }
+    # Echoes a request header as the backend received it.
+    location = /v1/echo {
+        return 200 '{"seen_chain":"\$http_x_forwarded_for"}';
+    }
     # Non-admin route: no audit header.
     location / {
         return 200 '{"ok":true}';
@@ -187,15 +193,16 @@ echo "PASS: nginx -t on the image's nginx.conf with both rendered templates (tls
 ENTRY_RE='^[^ ]+ - [^ ]+ \[[^]]+\] "([^"]*)" ([0-9]{3}) ([0-9]+) "[^"]*" "[^"]*" "[^"]*" rt=[0-9.]+ uct=([0-9.]+|-) urt=([0-9.]+|-) admin_audit_request_id="([^"]*)"$'
 
 # send <container> <probe> <url> [curl args...]
-# Sends one request to <url>?probe=<probe> with X-Forwarded-For: probe-<probe>.
-# The query string is not logged, so the entry is found by the X-Forwarded-For
-# field. Sets STATUS, BYTES, HEADERS (CRs stripped) and BODY as the client saw
-# them, and ENTRY to the single access-log line <container> wrote for it.
+# Sends one request to <url>?probe=<probe> with User-Agent
+# "<UA> probe=<probe>;<UA_EXTRA>"; the entry is found by that User-Agent
+# (";" ends the probe name). Sets STATUS, BYTES, HEADERS (CRs stripped) and
+# BODY as the client saw them, and ENTRY to the single access-log line
+# <container> wrote for it.
 send() {
     local ctr=$1 probe=$2 url=$3 meta
     shift 3
-    meta="$(curl -ks --max-time 10 -A "$UA" -D "$WORK_DIR/headers" -o "$WORK_DIR/body" \
-        -H "X-Forwarded-For: probe-$probe" \
+    meta="$(curl -ks --max-time 10 -A "$UA probe=$probe;${UA_EXTRA:-}" \
+        -D "$WORK_DIR/headers" -o "$WORK_DIR/body" \
         -w '%{http_code} %{size_download}' "$@" "$url?probe=$probe")" \
         || fail "$probe: request failed"
     read -r STATUS BYTES <<<"$meta"
@@ -203,7 +210,7 @@ send() {
     BODY="$(cat "$WORK_DIR/body")"
     ENTRY=""
     for _ in $(seq 1 50); do
-        ENTRY="$(docker logs "$ctr" 2>/dev/null | grep -F "\"probe-$probe\" rt=" || true)"
+        ENTRY="$(docker logs "$ctr" 2>/dev/null | grep -F "\"$UA probe=$probe;" || true)"
         [[ -n "$ENTRY" ]] && break
         sleep 0.1
     done
@@ -279,8 +286,8 @@ expect_entry "tls /nginx-health, no backend" 200 "GET /nginx-health HTTP/1.1" "-
 
 # --- 4. A client-controlled field cannot forge the audit field ----------------
 
-send "$TLS_CTR" forged-ua "$TLS_BASE/v1/admin/organizations" --http1.1 "${CONNECT[@]}" \
-    -A "x\" admin_audit_request_id=\"$CLIENT_AUDIT_ID"
+UA_EXTRA="x\" admin_audit_request_id=\"$CLIENT_AUDIT_ID" \
+    send "$TLS_CTR" forged-ua "$TLS_BASE/v1/admin/organizations" --http1.1 "${CONNECT[@]}"
 [[ "$ENTRY" =~ $ENTRY_RE && "${BASH_REMATCH[6]}" == "$SERVER_ID" ]] \
     || fail "forged-ua: end-anchored admin_audit_request_id is not the backend's ID: $ENTRY"
 [[ "$ENTRY" == *"admin_audit_request_id=\\x22$CLIENT_AUDIT_ID"* ]] \
@@ -360,6 +367,43 @@ send "$TLS_CTR" lookalike "$TLS_BASE/v1/tasks/task-0123456789abcdef0123" --http1
 expect_entry "API-key look-alike in the path" 200 "GET /v1/tasks/task-0123456789abcdef0123 HTTP/1.1" "-" yes
 expect_referer "API-key look-alike in the Referer" "https://app.example.invalid/tasks/task-0123456789abcdef0123"
 
+# --- Field after the User-Agent ----------------------------------------------
+
+# Group 1: the third quoted field after the request line.
+CHAIN_RE='^[^ ]+ - - \[[^]]+\] "[^"]*" [0-9]{3} [0-9]+ "[^"]*" "[^"]*" "([^"]*)" rt='
+CHAIN_VALUE="203.0.113.7, 203.0.113.8"
+
+# expect_chain <label> <field>
+expect_chain() {
+    local label=$1 want=$2
+    [[ "$ENTRY" =~ $CHAIN_RE ]] || fail "$label: unexpected access-log format: $ENTRY"
+    [[ "${BASH_REMATCH[1]}" == "$want" ]] \
+        || fail "$label: field is '${BASH_REMATCH[1]}', expected '$want'"
+    [[ "$ENTRY" != *"203.0.113."* ]] || fail "$label: unexpected value in the entry: $ENTRY"
+    echo "PASS: $label -> field is \"$want\""
+}
+
+send "$TLS_CTR" chain-none "$TLS_BASE/v1/echo" --http1.1 "${CONNECT[@]}"
+expect_entry "no chain header" 200 "GET /v1/echo HTTP/1.1" "-" yes
+expect_chain "no chain header" "-"
+
+send "$TLS_CTR" chain-tls "$TLS_BASE/v1/echo" --http1.1 "${CONNECT[@]}" \
+    -H "X-Forwarded-For: $CHAIN_VALUE"
+expect_entry "chain header over TLS" 200 "GET /v1/echo HTTP/1.1" "-" yes
+expect_chain "chain header over TLS" "[redacted]"
+# The backend receives the client's value with the peer appended.
+[[ "$BODY" == "{\"seen_chain\":\"$CHAIN_VALUE, "?*"\"}" ]] \
+    || fail "chain-tls: backend did not receive the header as expected: $BODY"
+echo "PASS: header reaches the backend unchanged"
+
+send "$TLS_CTR" chain-h2 "$TLS_BASE/v1/echo" --http2 "${CONNECT[@]}" \
+    -H "X-Forwarded-For: $CHAIN_VALUE"
+expect_chain "chain header over HTTP/2" "[redacted]"
+
+send "$PLAIN_CTR" chain-plain "$PLAIN_BASE/v1/echo" -H "Host: $DOMAIN" \
+    -H "X-Forwarded-For: $CHAIN_VALUE"
+expect_chain "chain header on the plain listener" "[redacted]"
+
 # --- 6. The error log keeps its detail but not the credentials ----------------
 # nginx quotes the request line, upstream URL and Referer in error messages.
 # Start the image through its real entrypoint (plain mode) with an unreachable
@@ -374,7 +418,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-curl -s --max-time 5 -o /dev/null -H "Host: $DOMAIN" \
+curl -s --max-time 5 -o /dev/null -H "Host: $DOMAIN" -H "X-Forwarded-For: $CHAIN_VALUE" \
     -e "https://app.example.invalid/settings?token=$FAKE_SESSION" \
     "$ENTRY_BASE/v1/models?api_key=$FAKE_KEY&probe=error-log" || true
 curl -s --max-time 5 -o /dev/null -H "Host: $DOMAIN" \
@@ -397,6 +441,8 @@ done
 ENTRY="$(docker logs "$ENTRY_CTR" 2>&1)"
 expect_no_secrets "error log"
 echo "PASS: error log keeps nginx's detail; query strings and tokens are removed"
+[[ "$ENTRY" != *"203.0.113."* ]] || fail "entrypoint container: unexpected value in its logs: $ENTRY"
+echo "PASS: entrypoint container access log uses the same format"
 
 echo
 echo "All admin audit log tests passed."
