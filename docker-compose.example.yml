@@ -13,6 +13,13 @@ services:
       BACKEND_HOST: "your-backend"
       BACKEND_PORT: "3000"
       STAGING: "true"
+      # Opt-in: accept PROXY protocol on TCP 8443 from an L4 proxy in front
+      # (every connection must then start with a PROXY header), take the
+      # client address from it only when the peer is in REAL_IP_FROM, and
+      # overwrite X-Forwarded-For / X-Real-IP with it. Disables QUIC/HTTP3 and
+      # the Alt-Svc advertisement (drop the UDP port mapping below too).
+      # PROXY_PROTOCOL: "true"
+      # REAL_IP_FROM: "10.0.2.2"   # required when PROXY_PROTOCOL=true; IPs/CIDRs, comma separated
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     ports:

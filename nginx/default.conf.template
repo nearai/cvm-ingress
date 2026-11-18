@@ -7,8 +7,13 @@
 # /nginx-health stays reachable on this catch-all so loopback/in-container
 # probes that address the listener by IP keep working in non-TLS mode.
 server {
-    listen 8443 default_server;
+    listen 8443 default_server${INGRESS_PP_LISTEN};
     server_name _;
+    # PROXY protocol mode only (empty by default): trust the PROXY header
+    # solely from the configured REAL_IP_FROM source(s) and take the client
+    # address from it. Repeated in both server blocks so it holds whichever
+    # one nginx has selected when the connection is first processed.
+    ${INGRESS_REAL_IP_CONF}
 
     # Parser errors can occur before nginx selects the matching Host server.
     error_page 400 401 403 404 405 408 413 414 421 431 494 /__cvm_ingress_4xx;
@@ -35,8 +40,13 @@ server {
 }
 
 server {
-    listen 8443;
+    listen 8443${INGRESS_PP_LISTEN};
     server_name ${DOMAIN};
+    # PROXY protocol mode only (empty by default): trust the PROXY header
+    # solely from the configured REAL_IP_FROM source(s) and take the client
+    # address from it. Repeated in both server blocks so it holds whichever
+    # one nginx has selected when the connection is first processed.
+    ${INGRESS_REAL_IP_CONF}
 
     proxy_buffering off;
     proxy_read_timeout 600s;
@@ -87,7 +97,12 @@ server {
         # forwarding the client-supplied value (nearai/infra#195).
         proxy_set_header Host ${DOMAIN};
         proxy_set_header X-Real-IP ${DOLLAR}remote_addr;
-        proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
+        # PROXY protocol mode: both headers are overwritten with the address
+        # recovered from the PROXY header (the realip-rewritten client address); any
+        # caller-supplied X-Forwarded-For / X-Real-IP is discarded. Default
+        # mode keeps the legacy append behaviour (the commented-out toggle).
+        ${INGRESS_XFF_LEGACY_OFF}proxy_set_header X-Forwarded-For ${DOLLAR}proxy_add_x_forwarded_for;
+        ${INGRESS_XFF_CONF}
         proxy_set_header X-Forwarded-Proto ${DOLLAR}scheme;
         proxy_http_version 1.1;
         proxy_set_header Connection "";

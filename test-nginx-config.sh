@@ -10,6 +10,13 @@
 #      (`server_tokens off`, nearai/infra#194).
 #   4. Boots each config and asserts the live `Server` response header carries
 #      no version string.
+#   5. PROXY protocol mode (PROXY_PROTOCOL=true + REAL_IP_FROM): the env
+#      validation accepts/rejects the right inputs (missing or wildcard source,
+#      junk, bad boolean), both templates render under it and pass `nginx -t`,
+#      and the effective config has proxy_protocol on every TCP listener,
+#      trusts only the configured source and has no QUIC listener. Default
+#      mode must carry none of that. Runtime behaviour is in
+#      tests/test-headers.sh.
 #
 # Requirements: docker, openssl, curl. Run from anywhere: ./test-nginx-config.sh
 set -euo pipefail
@@ -61,7 +68,7 @@ chmod -R a+rX "$WORKDIR"
 # --- Config-test + effective-config assertions ------------------------------
 check_config() {
     local mode=$1 conf=$2 extra_mounts=()
-    [[ "$mode" == "tls" ]] && extra_mounts=(-v "$WORKDIR/certs:/certs:ro")
+    [[ "$mode" == tls* ]] && extra_mounts=(-v "$WORKDIR/certs:/certs:ro")
 
     docker run --rm --tmpfs /run/nginx \
         -v "$SCRIPT_DIR/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
@@ -85,6 +92,83 @@ check_config() {
 }
 check_config plain default.conf
 check_config tls tls.conf
+
+# --- PROXY protocol mode (opt-in) ---------------------------------------------
+
+# validate_env in a subshell, as entrypoint.sh would run it. Prints nothing;
+# returns validate_env's status.
+run_validate() {
+    (
+        env "$@" bash -c 'source "'"$SCRIPT_DIR"'/lib/log.sh"; source "'"$SCRIPT_DIR"'/lib/validate.sh"; validate_env' >/dev/null 2>&1
+    )
+}
+expect_valid()   { run_validate DOMAIN="$DOMAIN" "$@" || fail "validate_env rejected: $*"; }
+expect_invalid() { run_validate DOMAIN="$DOMAIN" "$@" && fail "validate_env accepted: $*"; return 0; }
+
+expect_valid                                           # default: off, no REAL_IP_FROM needed
+expect_valid PROXY_PROTOCOL=false
+expect_valid PROXY_PROTOCOL=true REAL_IP_FROM=10.0.2.2
+expect_valid PROXY_PROTOCOL=true REAL_IP_FROM="10.0.2.2, 192.168.0.0/16,fd00::/8"
+expect_invalid PROXY_PROTOCOL=true                      # trusted source is required
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=0.0.0.0/0
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=::/0
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=0.0.0.0
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=10.0.0.0/0
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM=all
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM="10.0.2.2;"
+expect_invalid PROXY_PROTOCOL=true REAL_IP_FROM="unix:"
+expect_invalid PROXY_PROTOCOL=yes REAL_IP_FROM=10.0.2.2
+echo "OK: PROXY protocol env validation"
+
+# Render under PROXY protocol mode with the variables lib/validate.sh derives.
+render_pp() {
+    local template=$1 out=$2
+    (
+        source "$SCRIPT_DIR/lib/log.sh"
+        source "$SCRIPT_DIR/lib/validate.sh"
+        export DOMAIN BACKEND_HOST BACKEND_PORT DOLLAR='$'
+        PROXY_PROTOCOL=true REAL_IP_FROM="10.0.2.2" validate_env >/dev/null 2>&1
+        envsubst < "$SCRIPT_DIR/nginx/$template" > "$WORKDIR/$out"
+    )
+}
+render_pp default.conf.template default-pp.conf
+render_pp tls.conf.template tls-pp.conf
+chmod -R a+rX "$WORKDIR"
+
+check_config plain-pp default-pp.conf
+check_config tls-pp tls-pp.conf
+
+dump_of() {
+    local conf=$1 extra_mounts=()
+    [[ "$conf" == tls* ]] && extra_mounts=(-v "$WORKDIR/certs:/certs:ro")
+    docker run --rm --tmpfs /run/nginx \
+        -v "$SCRIPT_DIR/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+        -v "$WORKDIR/$conf:/etc/nginx/conf.d/default.conf:ro" \
+        "${extra_mounts[@]}" "$BASE_IMAGE" nginx -T 2>/dev/null
+}
+for conf in default.conf tls.conf default-pp.conf tls-pp.conf; do
+    dump=$(dump_of "$conf")
+    # nginx -T echoes raw file text; drop comment lines (incl. the commented-out
+    # QUIC toggles) so only active directives are judged.
+    dump=$(grep -Ev '^[[:space:]]*#' <<<"$dump")
+    listens=$(grep -E '^[[:space:]]*listen ' <<<"$dump")
+    case "$conf" in
+        *-pp.conf)
+            [[ -n "$listens" ]] || fail "$conf: no listeners in effective config"
+            grep -vq 'proxy_protocol' <<<"$listens" && fail "$conf: a listener lacks proxy_protocol: $(grep -v proxy_protocol <<<"$listens")"
+            grep -Eq '^[[:space:]]*(listen .*quic|http3 |add_header Alt-Svc)' <<<"$dump" && fail "$conf: QUIC/HTTP3/Alt-Svc present in effective config"
+            grep -q 'set_real_ip_from 10.0.2.2;' <<<"$dump" || fail "$conf: trusted source missing"
+            grep -q 'real_ip_header proxy_protocol;' <<<"$dump" || fail "$conf: real_ip_header proxy_protocol missing"
+            grep -q 'proxy_set_header X-Forwarded-For \$remote_addr;' <<<"$dump" || fail "$conf: X-Forwarded-For not overwritten"
+            ;;
+        *)
+            grep -Eq 'proxy_protocol|set_real_ip_from|real_ip_header' <<<"$dump" && fail "$conf: default mode contains PROXY protocol/realip config"
+            grep -q 'proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;' <<<"$dump" || fail "$conf: default X-Forwarded-For changed"
+            ;;
+    esac
+done
+echo "OK: effective config: PROXY mode on every listener, no QUIC, source pinned; default mode untouched"
 
 # --- Runtime assertion: Server header has no version ------------------------
 # Extra arguments after the URL are passed to curl. The TLS caller needs
