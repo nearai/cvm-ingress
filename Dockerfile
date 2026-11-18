@@ -1,7 +1,7 @@
-# Upstream nginx 1.29 on Debian Bookworm. Compiled with --with-http_v3_module
-# (verify: docker run --rm nginx:1.29-bookworm nginx -V 2>&1 | grep http_v3_module).
-# Pinned to the multi-platform index digest published 2025-09-29.
-FROM nginx:1.29-bookworm@sha256:8adbdcb969e2676478ee2c7ad333956f0c8e0e4c5a7463f4611d7a2e7a7ff5dc
+# Upstream nginx 1.30.7 (stable) on Debian Trixie. Compiled with --with-http_v3_module
+# (verify: docker run --rm nginx:1.30.7-trixie nginx -V 2>&1 | grep http_v3_module).
+# Pinned to the linux/amd64 image manifest, the only platform build-image.sh builds.
+FROM nginx:1.30.7-trixie@sha256:af61f605a001c7794200cae30093d8ee0da5183318df15fdfff3597ef37a7486
 
 ARG SOURCE_DATE_EPOCH=0
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
@@ -13,14 +13,14 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
 # repos — that would drift whenever upstream republishes the package.)
 # nginx itself is provided by the upstream image (from nginx.org's repo) and
 # is intentionally NOT listed here — pinning it via Debian's archive would
-# downgrade it to 1.22.x which lacks --with-http_v3_module.
+# replace it with Debian's older nginx build.
 # Snapshot CDN 503/504 bursts can outlast APT's default three retries. Allow
 # five retries, keep a 30s connection/data inactivity timeout, and fail if
 # any index is unavailable rather than proceeding with incomplete metadata.
 RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt,ro \
     set -e; \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20250411T024939Z bookworm main' > /etc/apt/sources.list && \
-    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20250411T024939Z bookworm-security main' >> /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20261117T000000Z trixie main' > /etc/apt/sources.list && \
+    echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20261117T000000Z trixie-security main' >> /etc/apt/sources.list && \
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/10no-check-valid-until && \
     rm -rf /etc/apt/sources.list.d/* && \
     mkdir -p /etc/apt/preferences.d && \
@@ -34,13 +34,9 @@ RUN --mount=type=bind,source=pinned-packages.txt,target=/tmp/pinned-packages.txt
     apt-get -o Acquire::Retries=5 \
         -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
         update --error-on=any && \
-    # --allow-downgrades is necessary because the upstream nginx image ships
-    # newer curl/libcurl4 (from nginx.org's mirrored debs) than the pinned
-    # Debian snapshot. Pinning to the snapshot keeps the rest of userland
-    # reproducible at the cost of one downgrade.
     apt-get -o Acquire::Retries=5 \
         -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-        install -y --no-install-recommends --allow-downgrades \
+        install -y --no-install-recommends \
         bash \
         ca-certificates \
         openssl \
