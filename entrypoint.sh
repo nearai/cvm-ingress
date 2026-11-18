@@ -33,7 +33,7 @@ derive_encryption_key() {
 }
 
 ensure_s3_bucket() {
-    if ! aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+    if ! aws s3api head-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1; then
         log_info "Bucket $S3_BUCKET does not exist, creating..."
         if ! aws s3api create-bucket --bucket "$S3_BUCKET" --region "${AWS_DEFAULT_REGION:-us-east-1}" \
             --create-bucket-configuration LocationConstraint="${AWS_DEFAULT_REGION:-us-east-1}" 2>/dev/null; then
